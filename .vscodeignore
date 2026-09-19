@@ -1,5 +1,6 @@
 *.conf
 *.sampleconf
+config/kokoreader.conf
 .gitignore
 .github
 *.vsix
@@ -7,4 +8,8 @@
 test/
 docs/
 __pycache__/
+**/__pycache__/**
 *model*/
+**/*.onnx
+**/*.bin
+**/*.download
