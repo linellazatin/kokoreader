@@ -130,5 +130,17 @@ run('GitHub workflow validates pull requests before packaging releases', () => {
     }
 });
 
+run('release tag-version command is valid Bash', () => {
+    const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
+    const command = workflow.match(/^\s+run: (test .+)$/m);
+    assert(command, 'missing tag-version command');
+    const result = spawnSync('bash', ['-c', command[1]], {
+        cwd: ROOT,
+        encoding: 'utf8',
+        env: { ...process.env, GITHUB_REF_NAME: 'v0.1.0' },
+    });
+    assert(result.status === 0, `invalid Bash: ${result.stderr}`);
+});
+
 console.log(`\n${passed}/${passed + failed} passed`);
 process.exit(failed ? 1 : 0);
