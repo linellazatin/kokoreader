@@ -5,7 +5,7 @@
   "icon": "images/openlines.png",
   "repository": { "type": "git", "url": "https://github.com/linellazatin/kokoreader" },
   "license": "MIT",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "openlines",
   "author": "Linel Lazatin",
   "engines": { "vscode": "^1.75.0" },
@@ -41,15 +41,16 @@
         "kokoreader.modelPrecision": { "type": "string", "order": 5, "enum": ["fp32", "fp16", "int8"], "default": "fp32", "description": "Model asset precision when modelDir is used." },
         "kokoreader.pythonPath": { "type": "string", "order": 1, "default": "", "description": "Python 3.11 or newer interpreter with requirements.txt installed." },
         "kokoreader.voice": { "type": "string", "order": 6, "default": "af_heart", "description": "Kokoro voice, or two comma-separated voices for an equal blend." },
-        "kokoreader.lang": { "type": "string", "order": 7, "default": "en-us", "description": "Kokoro language code." },
-        "kokoreader.speed": { "type": "number", "order": 8, "default": 1, "description": "Kokoro synthesis speed." },
+        "kokoreader.lang": { "type": "string", "order": 7, "default": "en-us", "description": "espeak-ng language code that kokoro-onnx passes through, not a Kokoro language letter (Mandarin is cmn, not zh). Run kokoreader --list-languages for accepted codes." },
+        "kokoreader.speed": { "type": "number", "order": 8, "minimum": 0.5, "maximum": 2, "default": 1, "description": "Kokoro synthesis speed (0.5-2.0). Use tempo for wider playback changes." },
         "kokoreader.tempo": { "type": "number", "order": 9, "default": 1, "description": "Pitch-preserving playback speed." },
         "kokoreader.gain": { "type": "number", "order": 10, "default": -1, "description": "ffmpeg gain in dB." },
         "kokoreader.volume": { "type": "number", "order": 11, "default": 1, "description": "Playback volume multiplier." },
         "kokoreader.format": { "type": "string", "order": 12, "enum": ["wav", "mp3", "flac", "opus"], "default": "wav", "description": "Output format used by Save to File." },
         "kokoreader.sampleRate": { "type": "number", "order": 13, "minimum": 0, "default": 0, "description": "Saved-audio sample rate in Hz. Set 0 to preserve Kokoro's source rate." },
         "kokoreader.normalize": { "type": "boolean", "order": 14, "default": false, "description": "Apply EBU R128 loudness normalization." },
-        "kokoreader.limiter": { "type": "boolean", "order": 15, "default": true, "description": "Limit output peaks to prevent clipping." }
+        "kokoreader.limiter": { "type": "boolean", "order": 15, "default": true, "description": "Limit output peaks to prevent clipping." },
+        "kokoreader.debug": { "type": "boolean", "order": 16, "default": false, "description": "Show Python worker errors for troubleshooting." }
       }
     }
   }
