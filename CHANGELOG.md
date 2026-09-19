@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+- Added Marketplace metadata and Open VSX release publishing.
+- Hardened temporary editor input, playback errors, and worker exits.
+- Enforced export format, stricter CLI validation, and model-file exclusions.
+- Pinned CI actions and VSIX packaging tools.
+
 ## 0.1.0
 
 - Initial CLI and VS Code/VSCodium extension.
