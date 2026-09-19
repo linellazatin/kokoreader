@@ -2,6 +2,7 @@
 
 const { spawnSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -56,6 +57,18 @@ run('invalid model precision is rejected before download', () => {
     assert(result.stderr.includes('model-precision must be fp32, fp16, or int8'), `stderr: ${result.stderr}`);
 });
 
+run('invalid playback values are rejected before inference', () => {
+    for (const [args, message] of [
+        [['--speed', '0'], 'speed must be greater than zero'],
+        [['--tempo', '0.25'], 'tempo must be between 0.5 and 100'],
+        [['--start-para', '-1'], 'start-para must be a non-negative integer'],
+    ]) {
+        const result = cli(args);
+        assert(result.status !== 0, `${args.join(' ')} unexpectedly succeeded`);
+        assert(result.stderr.includes(message), `stderr: ${result.stderr}`);
+    }
+});
+
 run('unknown options exit non-zero', () => {
     const result = cli(['--not-real']);
     assert(result.status !== 0, 'unknown option unexpectedly succeeded');
@@ -68,6 +81,38 @@ run('missing input file exits non-zero', () => {
     assert(result.stderr.includes('Error:'), `stderr: ${result.stderr}`);
 });
 
+run('file reads exit while the extension IPC pipe remains open', () => {
+    const probe = String.raw`
+const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const root = process.argv[1];
+const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-ipc-test-'));
+const input = path.join(temp, 'selection.txt');
+const model = path.join(temp, 'model.onnx');
+const voices = path.join(temp, 'voices.bin');
+const worker = path.join(temp, 'worker.js');
+const tools = path.join(temp, 'tools');
+const output = path.join(temp, 'output.wav');
+fs.mkdirSync(tools);
+fs.writeFileSync(input, 'A short selection.');
+fs.writeFileSync(model, 'model');
+fs.writeFileSync(voices, 'voices');
+fs.writeFileSync(worker, '#!/usr/bin/env node\nconst readline = require("readline");\nreadline.createInterface({ input: process.stdin }).on("line", line => { const { id } = JSON.parse(line); process.stdout.write(JSON.stringify({ id, pcm: "AAA=", sampleRate: 24000 }) + "\\n"); });\n');
+fs.writeFileSync(path.join(tools, 'ffmpeg'), '#!/usr/bin/env node\nprocess.stdin.resume();\n');
+fs.chmodSync(worker, 0o755);
+fs.chmodSync(path.join(tools, 'ffmpeg'), 0o755);
+const child = spawn(process.execPath, [path.join(root, 'bin', 'kokoreader.js'), '--python-path', worker, '--model', model, '--voices', voices, '--output', output, input], { stdio: ['pipe', 'ignore', 'pipe'], env: { ...process.env, PATH: tools + path.delimiter + process.env.PATH } });
+child.stderr.resume();
+const cleanup = () => fs.rmSync(temp, { recursive: true, force: true });
+child.on('exit', code => { cleanup(); process.exit(code === 0 ? 0 : 2); });
+setTimeout(() => { child.kill(); cleanup(); process.exit(1); }, 1000);
+`;
+    const result = spawnSync(process.execPath, ['-e', probe, ROOT], { cwd: ROOT, encoding: 'utf8', timeout: 5000 });
+    assert(result.status === 0, `file-reading child did not exit: ${result.stderr}`);
+});
+
 run('extension manifest exposes read, playback, and save commands', () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
     const commands = manifest.contributes.commands.map(command => command.command);
@@ -78,9 +123,11 @@ run('extension manifest exposes read, playback, and save commands', () => {
 
 run('extension save command and format setting are format-neutral', () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
     const save = manifest.contributes.commands.find(command => command.command === 'kokoreader.saveFile');
     assert(save.title.endsWith('Save to File'), `unexpected title: ${save.title}`);
     assert(manifest.contributes.configuration.properties['kokoreader.format'].description.includes('Save to File'), 'format setting does not describe Save to File');
+    assert(source.includes("process.on('error', error => { item.dispose()"), 'save process errors are not handled');
 });
 
 run('cursor command reads from the active cursor through document end', () => {
@@ -88,6 +135,19 @@ run('cursor command reads from the active cursor through document end', () => {
     assert(source.includes("registerCommand('kokoreader.readFromCursor'"), 'missing cursor command registration');
     assert(source.includes('editor.selection.active'), 'cursor command does not use active cursor');
     assert(source.includes('new vscode.Range(cursor, end)'), 'cursor command does not read through document end');
+});
+
+run('extension gives each temporary input private, process-owned cleanup', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
+    assert(source.includes("fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-'))"), 'temporary directory is not unique');
+    assert(source.includes('mode: 0o600'), 'temporary input is not private');
+    assert(source.includes('activeProc !== proc'), 'previous reader can still clear a newer reader state');
+});
+
+run('extension forwards both boolean output settings explicitly', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
+    assert(source.includes("'--no-normalize'"), 'normalize false is not forwarded');
+    assert(source.includes("'--no-limiter'"), 'limiter false is not forwarded');
 });
 
 run('extension manifest exposes output processing settings', () => {
@@ -125,9 +185,33 @@ run('CLI loads its default config from the config directory', () => {
 
 run('GitHub workflow validates pull requests before packaging releases', () => {
     const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
-    for (const fragment of ['pull_request:', "tags:\n      - 'v*'", 'npm test', 'node --check bin/kokoreader.js', 'python3 -m py_compile python/kokoro_worker.py', 'vsce package', 'needs: validate', 'softprops/action-gh-release@v2']) {
+    for (const fragment of ['pull_request:', "tags:\n      - 'v*'", 'permissions:\n      contents: read', 'npm test', 'node --check bin/kokoreader.js', 'python3 -m py_compile python/kokoro_worker.py', '@vscode/vsce@4.0.0', 'vsce package', 'needs: validate', 'publish release/kokoreader.vsix', 'softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65']) {
         assert(workflow.includes(fragment), `missing workflow step: ${fragment}`);
     }
+});
+
+run('GitHub Actions are pinned to immutable revisions', () => {
+    const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
+    for (const action of ['actions/checkout', 'actions/setup-node', 'actions/upload-artifact', 'actions/download-artifact', 'softprops/action-gh-release']) {
+        assert(new RegExp(`${action}@[0-9a-f]{40}`).test(workflow), `${action} is not pinned to a commit`);
+    }
+});
+
+run('local CLI configuration is excluded from VSIX packages', () => {
+    const ignore = fs.readFileSync(path.join(ROOT, '.vscodeignore'), 'utf8');
+    assert(ignore.split(/\r?\n/).includes('config/kokoreader.conf'), 'config/kokoreader.conf is not excluded');
+});
+
+run('local model assets are excluded from VSIX packages', () => {
+    const ignore = fs.readFileSync(path.join(ROOT, '.vscodeignore'), 'utf8').split(/\r?\n/);
+    for (const pattern of ['**/*.onnx', '**/*.bin', '**/*.download', '**/__pycache__/**']) {
+        assert(ignore.includes(pattern), `${pattern} is not excluded`);
+    }
+});
+
+run('saved audio uses the selected output format', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'bin', 'kokoreader.js'), 'utf8');
+    assert(source.includes("args.push('-f', cfg.FORMAT, cfg.OUTPUT_FILE)"), 'ffmpeg output format is inferred from filename instead of configuration');
 });
 
 run('release tag-version command is valid Bash', () => {
@@ -137,7 +221,7 @@ run('release tag-version command is valid Bash', () => {
     const result = spawnSync('bash', ['-c', command[1]], {
         cwd: ROOT,
         encoding: 'utf8',
-        env: { ...process.env, GITHUB_REF_NAME: 'v0.1.0' },
+        env: { ...process.env, GITHUB_REF_NAME: `v${require(path.join(ROOT, 'package.json')).version}` },
     });
     assert(result.status === 0, `invalid Bash: ${result.stderr}`);
 });

@@ -14,7 +14,7 @@ Kokoreader reads text and Markdown aloud with local Kokoro inference. It provide
 
 ## CI and releases
 
-Pull requests run the CLI tests, runtime syntax checks, and VSIX packaging. Pushing a `v<package-version>` tag runs the same validation job, then publishes its validated VSIX artifact with the matching changelog section as GitHub release notes.
+Pull requests run the CLI tests, runtime syntax checks, and VSIX packaging. Pushing a `v<package-version>` tag runs the same validation job, publishes its validated VSIX artifact to Open VSX, then creates a GitHub Release with the matching changelog section.
 
 ## Compatibility
 
@@ -151,12 +151,12 @@ printf 'Hello from Kokoreader.\n' | node bin/kokoreader.js
 | `-mp`, `--model-precision P` | Download/use `fp32` (default), `fp16`, or `int8` model assets. |
 | `-py`, `--python-path PATH` | Python interpreter executable. |
 | `-v`, `--voice NAME`; `-l`, `--lang CODE`; `-s`, `--speed N` | Voice, language, and Kokoro speed. |
-| `-t`, `--tempo N`; `-g`, `--gain DB`; `-vol`, `--volume N` | Final playback controls. |
-| `-f`, `--format TYPE`; `-sr`, `--sample-rate HZ` | Saved format and sample rate. |
+| `-t`, `--tempo N`; `-g`, `--gain DB`; `-vol`, `--volume N` | Final playback controls. Tempo accepts 0.5 through 100. |
+| `-f`, `--format TYPE`; `-sr`, `--sample-rate HZ` | Saved format and sample rate. The format controls encoding; use a matching filename extension. |
 | `-n`, `--normalize`; `-nn`, `--no-normalize` | Enable or disable EBU R128 normalization. |
 | `-lim`, `--limiter`; `-nlim`, `--no-limiter` | Enable or disable final peak limiting. |
 | `-o`, `--output FILE` | Save audio instead of playing. Use an extension that matches `--format`. |
-| `-sp`, `--start-para N` | Start at one-based paragraph N. |
+| `-sp`, `--start-para N` | Start at one-based paragraph N; `0` reads from the beginning. |
 | `-d`, `--download` | Download selected assets to `--model-dir`. |
 | `-ls`, `--list`; `-dbg`, `--debug` | List voices or show worker errors. |
 
