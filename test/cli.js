@@ -2,6 +2,7 @@
 
 const { spawnSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -78,6 +79,38 @@ run('missing input file exits non-zero', () => {
     const result = cli(['/missing/kokoreader-input.txt']);
     assert(result.status !== 0, 'missing file unexpectedly succeeded');
     assert(result.stderr.includes('Error:'), `stderr: ${result.stderr}`);
+});
+
+run('file reads exit while the extension IPC pipe remains open', () => {
+    const probe = String.raw`
+const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const root = process.argv[1];
+const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-ipc-test-'));
+const input = path.join(temp, 'selection.txt');
+const model = path.join(temp, 'model.onnx');
+const voices = path.join(temp, 'voices.bin');
+const worker = path.join(temp, 'worker.js');
+const tools = path.join(temp, 'tools');
+const output = path.join(temp, 'output.wav');
+fs.mkdirSync(tools);
+fs.writeFileSync(input, 'A short selection.');
+fs.writeFileSync(model, 'model');
+fs.writeFileSync(voices, 'voices');
+fs.writeFileSync(worker, '#!/usr/bin/env node\nconst readline = require("readline");\nreadline.createInterface({ input: process.stdin }).on("line", line => { const { id } = JSON.parse(line); process.stdout.write(JSON.stringify({ id, pcm: "AAA=", sampleRate: 24000 }) + "\\n"); });\n');
+fs.writeFileSync(path.join(tools, 'ffmpeg'), '#!/usr/bin/env node\nprocess.stdin.resume();\n');
+fs.chmodSync(worker, 0o755);
+fs.chmodSync(path.join(tools, 'ffmpeg'), 0o755);
+const child = spawn(process.execPath, [path.join(root, 'bin', 'kokoreader.js'), '--python-path', worker, '--model', model, '--voices', voices, '--output', output, input], { stdio: ['pipe', 'ignore', 'pipe'], env: { ...process.env, PATH: tools + path.delimiter + process.env.PATH } });
+child.stderr.resume();
+const cleanup = () => fs.rmSync(temp, { recursive: true, force: true });
+child.on('exit', code => { cleanup(); process.exit(code === 0 ? 0 : 2); });
+setTimeout(() => { child.kill(); cleanup(); process.exit(1); }, 1000);
+`;
+    const result = spawnSync(process.execPath, ['-e', probe, ROOT], { cwd: ROOT, encoding: 'utf8', timeout: 5000 });
+    assert(result.status === 0, `file-reading child did not exit: ${result.stderr}`);
 });
 
 run('extension manifest exposes read, playback, and save commands', () => {

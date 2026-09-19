@@ -305,7 +305,11 @@ async function read(inputFile, cfg) {
         }
         if (cfg.OUTPUT_FILE) await savePCM(Buffer.concat(audio), sampleRate, cfg);
         process.stderr.write('\n');
-    } finally { worker.close(); activeWorker = null; }
+    } finally {
+        worker.close();
+        activeWorker = null;
+        if (inputFile) process.stdin.destroy();
+    }
 }
 
 function download(url, destination) {
