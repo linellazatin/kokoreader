@@ -1,0 +1,14 @@
+# Copy to config/kokoreader.conf or point KOKORO_READER_CONFIG at this file.
+MODEL_DIR=/path/to/kokoro-models
+MODEL_PRECISION=fp32
+PYTHON_PATH=/path/to/python3.12
+VOICE=af_heart
+LANG=en-us
+SPEED=1.0
+TEMPO=1.0
+GAIN=-1
+VOLUME=1.0
+FORMAT=wav
+SAMPLE_RATE=0
+NORMALIZE=false
+LIMITER=true

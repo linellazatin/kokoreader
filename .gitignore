@@ -1,0 +1,4 @@
+*.conf
+*.vsix
+__pycache__/
+*model*/

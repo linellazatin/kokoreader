@@ -1,0 +1,10 @@
+*.conf
+*.sampleconf
+.gitignore
+.github
+*.vsix
+
+test/
+docs/
+__pycache__/
+*model*/
