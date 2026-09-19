@@ -1,5 +1,12 @@
 # Kokoreader
 
+<div align="center">
+
+[![Open VSX Downloads](https://img.shields.io/open-vsx/dt/openlines/kokoreader?logo=vscodium&label=open-vsx.org)](https://open-vsx.org/extension/openlines/kokoreader)
+[![VS Marketplace](https://img.shields.io/badge/VS_Marketplace-Kokoreader-white?labelColor=blue)](https://marketplace.visualstudio.com/items?itemName=openlines.kokoreader)
+
+</div>
+
 Kokoreader reads text and Markdown aloud with local Kokoro inference. It provides a Node.js CLI and a VS Code/VSCodium extension for an editor tab or selection. Synthesis is local: no account, API key, or cloud service is used after one-time dependency and model downloads.
 
 ## Repository layout
