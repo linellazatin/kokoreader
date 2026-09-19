@@ -2,3 +2,4 @@
 *.vsix
 __pycache__/
 *model*/
+.nanomneme/
