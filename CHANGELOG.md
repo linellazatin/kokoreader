@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.2 - MAJOR RUNTIME FIXES
+## 0.1.2
 
 - Fixed CLI signal handling: `SIGINT`, `SIGTERM`, and `SIGHUP` now run `killActive()` before exit, so the Python worker, `ffmpeg`, and `ffplay` no longer outlive the CLI and the extension's 500 ms fallback kill is safe.
 - Fixed pause between paragraphs: state moved to a `playbackPaused` latch that `playPCM` re-applies to the next spawned `ffplay`, instead of `pausePlayback` returning early when no player is alive during synthesis.
