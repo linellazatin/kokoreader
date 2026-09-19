@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -20,13 +21,28 @@ const MODEL_URLS = {
     int8: 'https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx',
 };
 const VOICES_URL = 'https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin';
+// SHA-256 of every asset in the model-files-v1.0 release, computed from the
+// release itself. Without these, a truncated or stale asset is only noticed as
+// an opaque failure inside onnxruntime, if at all.
+const ASSET_SHA256 = {
+    'kokoro-v1.0.onnx': '7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5',
+    'kokoro-v1.0.fp16.onnx': 'c1610a859f3bdea01107e73e50100685af38fff88f5cd8e5c56df109ec880204',
+    'kokoro-v1.0.int8.onnx': '6e742170d309016e5891a994e1ce1559c702a2ccd0075e67ef7157974f6406cb',
+    'voices-v1.0.bin': 'bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d',
+};
 const DEFAULTS = {
     MODEL_DIR: '', MODEL_PATH: '', VOICES_PATH: '', PYTHON_PATH: '',
     MODEL_PRECISION: 'fp32',
     VOICE: 'af_heart', LANG: 'en-us', SPEED: 1, TEMPO: 1, GAIN: -1,
     VOLUME: 1, FORMAT: 'wav', SAMPLE_RATE: 0, NORMALIZE: false, LIMITER: true,
-    OUTPUT_FILE: '', START_PARA: 0, DEBUG: false,
+    OUTPUT_FILE: '', START_PARA: 0, DEBUG: false, FORCE: false,
 };
+
+const INSTALL_DIR = path.join(__dirname, '..');
+const PATH_CONFIG_KEYS = new Set(['MODEL_DIR', 'MODEL_PATH', 'VOICES_PATH']);
+// Model and playback settings only: a config file must not quietly change what a
+// single run does, or every editor read would overwrite the same output file.
+const IGNORED_CONFIG_KEYS = new Set(['OUTPUT_FILE', 'START_PARA', 'DEBUG', 'FORCE']);
 
 function loadConfig() {
     const cfg = { ...DEFAULTS };
@@ -37,10 +53,13 @@ function loadConfig() {
     if (!configPath || !fs.existsSync(configPath)) return cfg;
     for (const line of fs.readFileSync(configPath, 'utf8').split('\n')) {
         const match = line.trim().match(/^([A-Z_]+)\s*=\s*"?(.*?)"?\s*$/);
-        if (!match || !(match[1] in DEFAULTS)) continue;
+        if (!match || !(match[1] in DEFAULTS) || IGNORED_CONFIG_KEYS.has(match[1])) continue;
         const [_, key, value] = match;
         cfg[key] = typeof DEFAULTS[key] === 'number' ? Number(value) :
             typeof DEFAULTS[key] === 'boolean' ? /^(1|true|yes)$/i.test(value) : value;
+        // Relative paths in a config file mean "relative to the install", not to
+        // whatever directory the editor host or shell happens to run from.
+        if (PATH_CONFIG_KEYS.has(key) && value && !path.isAbsolute(value)) cfg[key] = path.resolve(INSTALL_DIR, value);
     }
     return cfg;
 }
@@ -56,7 +75,7 @@ function usage() {
 `  -py, --python-path PATH    Python 3.11 or newer interpreter\n` +
 `  -v, --voice NAME           Kokoro voice (default: af_heart)\n` +
 `  -l, --lang CODE            Language code (default: en-us)\n` +
-`  -s, --speed N              Kokoro synthesis speed (default: 1)\n\n` +
+`  -s, --speed N              Kokoro synthesis speed 0.5-2.0 (default: 1)\n\n` +
 `Playback:\n` +
 `  -t, --tempo N              Pitch-preserving playback speed (default: 1)\n` +
 `  -g, --gain DB              ffmpeg gain in dB (default: -1)\n` +
@@ -71,7 +90,9 @@ function usage() {
 `  -sp, --start-para N        Start at paragraph N (1-based)\n\n` +
 `Management:\n` +
 `  -d, --download             Download model and voice data to --model-dir\n` +
+`  --force                    With --download, replace assets that fail SHA-256 checks\n` +
 `  -ls, --list                List available Kokoro voices\n` +
+`  -ll, --list-languages      List the espeak-ng codes --lang accepts\n` +
 `  -dbg, --debug              Show worker errors\n` +
 `  -h, --help                 Show this help\n`);
 }
@@ -107,7 +128,9 @@ function parseArgs(argv, cfg) {
             case '-o': case '--output': cfg.OUTPUT_FILE = value(); break;
             case '-sp': case '--start-para': cfg.START_PARA = Number(value()); break;
             case '-d': case '--download': action = 'download'; break;
+            case '--force': cfg.FORCE = true; break;
             case '-ls': case '--list': action = 'list'; break;
+            case '-ll': case '--list-languages': action = 'languages'; break;
             case '-dbg': case '--debug': cfg.DEBUG = true; break;
             case '--': inputFile = value(); break;
             default:
@@ -118,12 +141,13 @@ function parseArgs(argv, cfg) {
     for (const key of ['GAIN', 'VOLUME']) {
         if (!Number.isFinite(cfg[key])) throw new Error(`Invalid numeric value for ${key.toLowerCase()}`);
     }
-    if (!Number.isFinite(cfg.SPEED) || cfg.SPEED <= 0) throw new Error('speed must be greater than zero');
+    if (!Number.isFinite(cfg.SPEED) || cfg.SPEED < 0.5 || cfg.SPEED > 2) throw new Error('speed must be between 0.5 and 2.0');
     if (!Number.isFinite(cfg.TEMPO) || cfg.TEMPO < 0.5 || cfg.TEMPO > 100) throw new Error('tempo must be between 0.5 and 100');
     if (!Number.isInteger(cfg.START_PARA) || cfg.START_PARA < 0) throw new Error('start-para must be a non-negative integer');
     if (!Number.isInteger(cfg.SAMPLE_RATE) || cfg.SAMPLE_RATE < 0) throw new Error('sample-rate must be a non-negative integer');
     if (!['wav', 'mp3', 'flac', 'opus'].includes(cfg.FORMAT)) throw new Error('format must be wav, mp3, flac, or opus');
     if (!Object.hasOwn(MODEL_FILES, cfg.MODEL_PRECISION)) throw new Error('model-precision must be fp32, fp16, or int8');
+    if (cfg.FORCE && action !== 'download') throw new Error('--force requires --download');
     return { inputFile, action };
 }
 
@@ -146,7 +170,7 @@ function stripMarkdown(text) {
     return text.replace(/^```[\s\S]*?^```\s*$/gm, '')
         .replace(/`([^`]*)`/g, '$1').replace(/^[ \t]*#+[ \t]*/gm, '')
         .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
-        .replace(/<[^>]*>/g, '').replace(/\*\*([^*]*)\*\*/g, '$1')
+        .replace(/<\/?[a-zA-Z!][^>]*>/g, '').replace(/\*\*([^*]*)\*\*/g, '$1')
         .replace(/__([^_]*)__/g, '$1').replace(/\*([^*]*)\*/g, '$1')
         .replace(/^[ \t]*[-*=]{3,}[ \t]*$/gm, '').replace(/\n{3,}/g, '\n\n');
 }
@@ -199,37 +223,68 @@ class Worker {
     }
     async synthesize(text, cfg) {
         const response = await this.request({ action: 'synthesize', text, voice: cfg.VOICE, lang: cfg.LANG, speed: cfg.SPEED });
+        if (response.warning) warnOnce(response.warning);
         return { pcm: Buffer.from(response.pcm, 'base64'), sampleRate: response.sampleRate };
     }
     async list() { return (await this.request({ action: 'list' })).voices; }
+    async languages() { return this.request({ action: 'languages' }); }
     close() { try { this.proc.kill(); } catch (_) {} }
+}
+
+// espeak-ng degrades a whole paragraph the same way, so one report per distinct
+// message is enough; repeating it per paragraph buries the progress line.
+const shownWarnings = new Set();
+function warnOnce(message) {
+    if (shownWarnings.has(message)) return;
+    shownWarnings.add(message);
+    process.stderr.write(`\nKokoreader: ${message}\n`);
 }
 
 let activeFfmpeg = null;
 let activeFfplay = null;
 let activeWorker = null;
+let activePartFile = null;
+let playbackPaused = false;
 
 function killActive() {
-    for (const process of [activeWorker && activeWorker.proc, activeFfmpeg, activeFfplay]) {
-        try { process && process.kill(); } catch (_) {}
+    for (const child of [activeWorker && activeWorker.proc, activeFfmpeg, activeFfplay]) {
+        try { child && child.kill(); } catch (_) {}
     }
     activeFfmpeg = activeFfplay = activeWorker = null;
+    playbackPaused = false;
+    // process.exit skips read()'s finally, so the in-flight encoder's temporary
+    // file has to be reaped here or Ctrl-C and Stop litter the user's folder.
+    if (activePartFile) { try { fs.unlinkSync(activePartFile); } catch (_) {} activePartFile = null; }
 }
 
-function pausePlayback() {
-    if (!activeFfplay) return;
-    if (process.platform === 'win32') return processControl(activeFfplay.pid, 'Suspend');
-    try { process.kill(activeFfplay.pid, 'SIGSTOP'); } catch (_) {}
-}
-
-function resumePlayback() {
-    if (!activeFfplay) return;
-    if (process.platform === 'win32') return processControl(activeFfplay.pid, 'Resume');
-    try { process.kill(activeFfplay.pid, 'SIGCONT'); } catch (_) {}
+// A signal that bypasses the stdin 'stop' line (editor reload, Ctrl-C, the
+// extension's fallback kill) must still reap the resident worker and player.
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(signal, () => { killActive(); process.exit(128); });
 }
 
 function processControl(pid, verb) {
     spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', `${verb}-Process -Id ${pid}`], { stdio: 'ignore' });
+}
+
+function suspendProcess(pid) {
+    if (process.platform === 'win32') return processControl(pid, 'Suspend');
+    try { process.kill(pid, 'SIGSTOP'); } catch (_) {}
+}
+
+function resumeProcess(pid) {
+    if (process.platform === 'win32') return processControl(pid, 'Resume');
+    try { process.kill(pid, 'SIGCONT'); } catch (_) {}
+}
+
+function pausePlayback() {
+    playbackPaused = true;
+    if (activeFfplay) suspendProcess(activeFfplay.pid);
+}
+
+function resumePlayback() {
+    playbackPaused = false;
+    if (activeFfplay) resumeProcess(activeFfplay.pid);
 }
 
 function setupIPC() {
@@ -251,6 +306,14 @@ function playPCM(pcm, sampleRate, cfg) {
     return new Promise((resolve, reject) => {
         const ffmpeg = activeFfmpeg = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg), '-f', 'wav', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
         const ffplay = activeFfplay = spawn('ffplay', ['-nodisp', '-autoexit', '-f', 'wav', '-i', 'pipe:0'], { stdio: ['pipe', 'ignore', 'ignore'] });
+        // The pause latch can be set while this paragraph was still synthesizing.
+        // ponytail: spawn-then-stop leaves a few ms of blip; Node cannot spawn
+        // suspended. Drop this once one long-lived player replaces per-paragraph ffplay.
+        if (playbackPaused) suspendProcess(ffplay.pid);
+        // A child that dies mid-stream makes its pipes emit EPIPE/ERR_STREAM_DESTROYED.
+        // The 'exit' handlers already report the failure; this only stops an unhandled
+        // stream error from replacing that report with a raw stack trace.
+        for (const stream of [ffmpeg.stdin, ffmpeg.stdout, ffplay.stdin]) stream.on('error', () => {});
         let ffmpegDone = false, ffplayDone = false, settled = false;
         const finish = error => {
             if (settled) return;
@@ -269,16 +332,34 @@ function playPCM(pcm, sampleRate, cfg) {
     });
 }
 
-function savePCM(raw, sampleRate, cfg) {
-    return new Promise((resolve, reject) => {
-        const args = ['-y', '-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg)];
-        if (cfg.SAMPLE_RATE) args.push('-ar', String(cfg.SAMPLE_RATE));
-        args.push('-f', cfg.FORMAT, cfg.OUTPUT_FILE);
-        const ffmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'ignore'] });
-        ffmpeg.stdin.end(raw);
+function startSaveEncoder(cfg, sampleRate) {
+    // One encoder for the whole document, fed as paragraphs are synthesized: the
+    // old design buffered every paragraph and encoded at the end, which cost
+    // ~1.65 MB per spoken minute and lost all work if anything failed late.
+    const temporary = `${cfg.OUTPUT_FILE}.part`;
+    activePartFile = temporary;
+    const args = ['-y', '-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg)];
+    if (cfg.SAMPLE_RATE) args.push('-ar', String(cfg.SAMPLE_RATE));
+    args.push('-f', cfg.FORMAT, temporary);
+    const ffmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'ignore'] });
+    ffmpeg.stdin.on('error', () => {});
+    const done = new Promise((resolve, reject) => {
         ffmpeg.on('error', reject);
-        ffmpeg.on('exit', code => code === 0 ? resolve() : reject(new Error(`ffmpeg exited with code ${code}`)));
+        ffmpeg.on('exit', code => {
+            if (code !== 0) return reject(new Error(`ffmpeg exited with code ${code}`));
+            if (!fs.existsSync(temporary)) return reject(new Error(`ffmpeg produced no audio for ${cfg.OUTPUT_FILE}`));
+            try { fs.renameSync(temporary, cfg.OUTPUT_FILE); if (activePartFile === temporary) activePartFile = null; resolve(); }
+            catch (error) { reject(error); }
+        });
     });
+    // Publish atomically: a failed read must leave the previous file alone, and
+    // the killed encoder must not leave a stray .part behind.
+    done.catch(() => { try { fs.unlinkSync(temporary); } catch (_) {} });
+    return {
+        stdin: ffmpeg.stdin,
+        done,
+        abort() { try { ffmpeg.stdin.destroy(); ffmpeg.kill(); } catch (_) {} },
+    };
 }
 
 function readStdin() {
@@ -292,19 +373,27 @@ async function read(inputFile, cfg) {
     if (!text.length) throw new Error('Nothing to read.');
     if (cfg.START_PARA > text.length) throw new Error(`start-para must be no greater than the number of paragraphs (${text.length})`);
     const worker = activeWorker = new Worker(cfg);
+    let saver = null;
     try {
-        let sampleRate = null;
-        const audio = [];
         for (let index = 0; index < text.length; index++) {
             if (cfg.START_PARA && index + 1 < cfg.START_PARA) continue;
             process.stderr.write(`\r[${index + 1}/${text.length}] synthesizing...`);
             const result = await worker.synthesize(text[index], cfg);
-            sampleRate = sampleRate || result.sampleRate;
-            if (cfg.OUTPUT_FILE) audio.push(result.pcm);
-            else { process.stderr.write(`\r[${index + 1}/${text.length}] playing...     `); await playPCM(result.pcm, result.sampleRate, cfg); }
+            if (cfg.OUTPUT_FILE) {
+                if (!saver) saver = startSaveEncoder(cfg, result.sampleRate);
+                // The write callback fires once flushed to the OS, which is the
+                // backpressure that keeps memory bounded to one paragraph.
+                await new Promise((resolve, reject) => saver.stdin.write(result.pcm, error => error ? reject(error) : resolve()));
+            } else {
+                process.stderr.write(`\r[${index + 1}/${text.length}] playing...     `);
+                await playPCM(result.pcm, result.sampleRate, cfg);
+            }
         }
-        if (cfg.OUTPUT_FILE) await savePCM(Buffer.concat(audio), sampleRate, cfg);
+        if (saver) { saver.stdin.end(); await saver.done; }
         process.stderr.write('\n');
+    } catch (error) {
+        if (saver) saver.abort();
+        throw error;
     } finally {
         worker.close();
         activeWorker = null;
@@ -312,16 +401,40 @@ async function read(inputFile, cfg) {
     }
 }
 
-function download(url, destination) {
+function download(url, destination, redirects = 0) {
     return new Promise((resolve, reject) => {
-        https.get(url, response => {
-            if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) return resolve(download(response.headers.location, destination));
-            if (response.statusCode !== 200) return reject(new Error(`download failed: HTTP ${response.statusCode}`));
+        const request = https.get(url, response => {
+            if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                response.resume();
+                if (redirects >= 5) return reject(new Error('download failed: too many redirects'));
+                return resolve(download(new URL(response.headers.location, url).href, destination, redirects + 1));
+            }
+            if (response.statusCode !== 200) { response.resume(); return reject(new Error(`download failed: HTTP ${response.statusCode}`)); }
+            const expected = Number(response.headers['content-length']);
             const file = fs.createWriteStream(destination);
+            let received = 0;
+            response.on('data', chunk => { received += chunk.length; });
             response.pipe(file);
-            file.on('finish', () => file.close(resolve));
             file.on('error', reject);
-        }).on('error', reject);
+            response.on('error', reject);
+            file.on('finish', () => file.close(() => {
+                // A truncated asset renames to the real filename and then fails
+                // opaquely at inference time, so reject it here instead.
+                if (expected && received !== expected) return reject(new Error(`download failed: incomplete (${received}/${expected} bytes)`));
+                resolve();
+            }));
+        });
+        request.setTimeout(60000, () => request.destroy(new Error('download timed out')));
+        request.on('error', reject);
+    });
+}
+
+function sha256File(file) {
+    return new Promise((resolve, reject) => {
+        const hash = crypto.createHash('sha256');
+        fs.createReadStream(file).on('error', reject).pipe(hash);
+        hash.on('error', reject);
+        hash.on('finish', () => resolve(hash.digest('hex')));
     });
 }
 
@@ -331,9 +444,28 @@ async function downloadAssets(cfg) {
     const downloads = { [MODEL_FILES[cfg.MODEL_PRECISION]]: MODEL_URLS[cfg.MODEL_PRECISION], [VOICES_FILE]: VOICES_URL };
     for (const [name, url] of Object.entries(downloads)) {
         const target = path.join(cfg.MODEL_DIR, name);
-        if (fs.existsSync(target)) { process.stdout.write(`Already present: ${target}\n`); continue; }
+        const expected = ASSET_SHA256[name];
+        if (fs.existsSync(target)) {
+            if (!expected) { process.stdout.write(`Already present: ${target} (no pinned digest)\n`); continue; }
+            if (await sha256File(target) === expected) { process.stdout.write(`Already present: ${target}\n`); continue; }
+            // Never overwrite an asset the user may have placed deliberately, such
+            // as a custom voice set; --force says "yes, replace this one".
+            if (!cfg.FORCE) {
+                process.stderr.write(`${target} does not match the kokoro-onnx model-files-v1.0 release. Rerun with --download --force to replace it.\n`);
+                continue;
+            }
+            process.stdout.write(`Replacing unverified ${name}...\n`);
+        }
         const temporary = `${target}.download`;
-        try { process.stdout.write(`Downloading ${name}...\n`); await download(url, temporary); fs.renameSync(temporary, target); }
+        try {
+            process.stdout.write(`Downloading ${name}...\n`);
+            await download(url, temporary);
+            if (expected) {
+                const digest = await sha256File(temporary);
+                if (digest !== expected) throw new Error(`${name} is corrupt: sha256 ${digest}, expected ${expected}`);
+            }
+            fs.renameSync(temporary, target);
+        }
         finally { try { fs.unlinkSync(temporary); } catch (_) {} }
     }
 }
@@ -348,6 +480,20 @@ async function main() {
         const worker = new Worker(cfg);
         try { for (const voice of await worker.list()) process.stdout.write(`${voice}\n`); }
         finally { worker.close(); }
+        return;
+    }
+    if (parsed.action === 'languages') {
+        const worker = new Worker(cfg);
+        try {
+            const report = await worker.languages();
+            process.stdout.write('Kokoro voices, by the espeak-ng code their initial requires:\n');
+            for (const row of report.kokoro) {
+                process.stdout.write(`  ${row.letter}  ${String(row.lang || '(none)').padEnd(8)} ${row.voices} voice(s)\n`);
+            }
+            const codes = Object.keys(report.espeak).sort();
+            process.stdout.write(`\nespeak-ng codes this install accepts (${codes.length}):\n`);
+            for (const code of codes) process.stdout.write(`  ${code.padEnd(12)}${report.espeak[code]}\n`);
+        } finally { worker.close(); }
         return;
     }
     if (parsed.inputFile && !fs.existsSync(parsed.inputFile)) throw new Error(`file not found: ${parsed.inputFile}`);

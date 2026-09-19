@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 
 let activeProc = null;
+let activeSave = null;
 let statusItem = null;
 let paused = false;
 let activeTemporary = null;
@@ -38,6 +39,7 @@ function configArgs(config) {
     add('--speed', 'speed'); add('--tempo', 'tempo'); add('--gain', 'gain'); add('--volume', 'volume');
     add('--format', 'format'); add('--sample-rate', 'sampleRate');
     addBool('--normalize', '--no-normalize', 'normalize'); addBool('--limiter', '--no-limiter', 'limiter');
+    if (config.get('debug')) args.push('--debug');
     return args;
 }
 
@@ -61,13 +63,14 @@ function spawnCli(args, options) {
 function stop() {
     paused = false;
     setState(false, false);
-    const process = activeProc;
+    if (activeSave) { try { activeSave.kill(); } catch (_) {} activeSave = null; }
+    const reader = activeProc;
     const temporary = activeTemporary;
     activeProc = null;
     activeTemporary = null;
-    if (process) {
-        try { process.stdin.write('stop\n'); } catch (_) {}
-        setTimeout(() => { try { process.kill(); } catch (_) {} }, 500);
+    if (reader) {
+        try { reader.stdin.write('stop\n'); } catch (_) {}
+        setTimeout(() => { try { reader.kill(); } catch (_) {} }, 500);
     }
     if (statusItem) statusItem.hide();
     cleanupTemporary(temporary);
@@ -86,6 +89,11 @@ function activate(context) {
     function startReading(config, file, status, temporary = null) {
         updateStatus(status);
         const proc = spawnCli([...configArgs(config), file], { stdio: ['pipe', 'ignore', 'pipe'] });
+        let lastLine = '';
+        const note = chunk => {
+            const lines = chunk.toString().replace(/\r/g, '\n').trim().split('\n').filter(Boolean);
+            if (lines.length) { lastLine = lines[lines.length - 1]; updateStatus(lastLine); }
+        };
         activeProc = proc;
         activeTemporary = temporary;
         const finish = () => {
@@ -98,9 +106,18 @@ function activate(context) {
             setState(false, false);
             statusItem.hide();
         };
-        proc.stderr.on('data', chunk => updateStatus(chunk.toString().replace(/\r/g, '\n').trim().split('\n').filter(Boolean).pop()));
+        proc.stderr.on('data', note);
         proc.on('error', error => { if (activeProc === proc) vscode.window.showErrorMessage(`Kokoreader: ${error.message}`); finish(); });
-        proc.on('exit', finish);
+        proc.on('exit', code => {
+            if (code && activeProc === proc) {
+                // Progress is written with \r and the error with no leading newline,
+                // so the two often arrive as one line: "[3/3] synthesizing...Error: …".
+                const at = lastLine.indexOf('Error: ');
+                const detail = at >= 0 ? lastLine.slice(at + 7).trim() : `reader failed (exit ${code})`;
+                vscode.window.showErrorMessage(`Kokoreader: reader failed: ${detail}`);
+            }
+            finish();
+        });
         setState(true, false);
         statusItem.tooltip = 'Click to stop Kokoreader';
         statusItem.show();
@@ -160,11 +177,13 @@ function activate(context) {
         });
         if (!target) return;
         const process = spawnCli([...configArgs(config), '--output', target.fsPath, file], { stdio: 'ignore' });
+        activeSave = process;
+        const clearSave = () => { if (activeSave === process) activeSave = null; };
         const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         item.text = `$(sync~spin) Kokoreader: saving ${path.basename(target.fsPath)}...`;
         item.show();
-        process.on('error', error => { item.dispose(); vscode.window.showErrorMessage(`Kokoreader: ${error.message}`); });
-        process.on('exit', code => { item.dispose(); vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (exit ${code})`); });
+        process.on('error', error => { item.dispose(); clearSave(); vscode.window.showErrorMessage(`Kokoreader: ${error.message}`); });
+        process.on('exit', code => { item.dispose(); clearSave(); vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (exit ${code})`); });
     });
     context.subscriptions.push(readCommand, cursorCommand, pauseCommand, resumeCommand, stopCommand, saveCommand);
 }

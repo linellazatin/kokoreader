@@ -1,10 +1,15 @@
 # Copy to config/kokoreader.conf or point KOKORO_READER_CONFIG at this file.
+# Relative MODEL_DIR, MODEL_PATH, and VOICES_PATH resolve against the install directory.
+# OUTPUT_FILE, START_PARA, DEBUG, and FORCE are CLI flags only and are ignored here.
 MODEL_DIR=/path/to/kokoro-models
 MODEL_PRECISION=fp32
 PYTHON_PATH=/path/to/python3.12
 VOICE=af_heart
+# LANG is an espeak-ng code, not Kokoro's language letter: Mandarin is cmn, not zh.
+# Run kokoreader --list-languages for the codes this install accepts.
 LANG=en-us
 SPEED=1.0
+# SPEED must be between 0.5 and 2.0; use TEMPO for larger playback changes.
 TEMPO=1.0
 GAIN=-1
 VOLUME=1.0
