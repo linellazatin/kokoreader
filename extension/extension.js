@@ -9,34 +9,35 @@ const path = require('path');
 let activeProc = null;
 let statusItem = null;
 let paused = false;
-let selectionFile = null;
+let activeTemporary = null;
 
 function setState(playing, isPaused) {
     vscode.commands.executeCommand('setContext', 'kokoreader.isPlaying', playing);
     vscode.commands.executeCommand('setContext', 'kokoreader.isPaused', isPaused);
 }
 
-function cleanupSelection() {
-    if (!selectionFile) return;
-    try { fs.unlinkSync(selectionFile); } catch (_) {}
-    selectionFile = null;
+function cleanupTemporary(temporary) {
+    if (!temporary) return;
+    try { fs.rmSync(temporary.dir, { recursive: true, force: true }); } catch (_) {}
 }
 
 function writeTemporaryText(text) {
-    selectionFile = path.join(os.tmpdir(), `kokoreader-selection-${process.pid}-${Date.now()}.txt`);
-    fs.writeFileSync(selectionFile, text, 'utf8');
-    return selectionFile;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-'));
+    const file = path.join(dir, 'input.txt');
+    try { fs.writeFileSync(file, text, { encoding: 'utf8', mode: 0o600 }); }
+    catch (error) { cleanupTemporary({ dir }); throw error; }
+    return { dir, file };
 }
 
 function configArgs(config) {
     const args = [];
     const add = (flag, name) => { const value = config.get(name); if (typeof value !== 'boolean' && value !== '' && value != null) args.push(flag, String(value)); };
-    const addBool = (flag, name) => { if (config.get(name)) args.push(flag); };
+    const addBool = (enabled, disabled, name) => args.push(config.get(name) ? enabled : disabled);
     add('--model-dir', 'modelDir'); add('--model', 'modelPath'); add('--voices', 'voicesPath'); add('--model-precision', 'modelPrecision');
     add('--python-path', 'pythonPath'); add('--voice', 'voice'); add('--lang', 'lang');
     add('--speed', 'speed'); add('--tempo', 'tempo'); add('--gain', 'gain'); add('--volume', 'volume');
     add('--format', 'format'); add('--sample-rate', 'sampleRate');
-    addBool('--normalize', 'normalize'); addBool('--limiter', 'limiter');
+    addBool('--normalize', '--no-normalize', 'normalize'); addBool('--limiter', '--no-limiter', 'limiter');
     return args;
 }
 
@@ -60,14 +61,16 @@ function spawnCli(args, options) {
 function stop() {
     paused = false;
     setState(false, false);
-    if (activeProc) {
-        try { activeProc.stdin.write('stop\n'); } catch (_) {}
-        const process = activeProc;
+    const process = activeProc;
+    const temporary = activeTemporary;
+    activeProc = null;
+    activeTemporary = null;
+    if (process) {
+        try { process.stdin.write('stop\n'); } catch (_) {}
         setTimeout(() => { try { process.kill(); } catch (_) {} }, 500);
-        activeProc = null;
     }
     if (statusItem) statusItem.hide();
-    cleanupSelection();
+    cleanupTemporary(temporary);
 }
 
 function updateStatus(text) {
@@ -80,11 +83,24 @@ function activate(context) {
     context.subscriptions.push(statusItem);
     setState(false, false);
 
-    function startReading(config, file, status) {
+    function startReading(config, file, status, temporary = null) {
         updateStatus(status);
-        activeProc = spawnCli([...configArgs(config), file], { stdio: ['pipe', 'ignore', 'pipe'] });
-        activeProc.stderr.on('data', chunk => updateStatus(chunk.toString().replace(/\r/g, '\n').trim().split('\n').filter(Boolean).pop()));
-        activeProc.on('exit', () => { activeProc = null; paused = false; cleanupSelection(); setState(false, false); statusItem.hide(); });
+        const proc = spawnCli([...configArgs(config), file], { stdio: ['pipe', 'ignore', 'pipe'] });
+        activeProc = proc;
+        activeTemporary = temporary;
+        const finish = () => {
+            if (activeProc !== proc) return;
+            activeProc = null;
+            const ownedTemporary = activeTemporary;
+            activeTemporary = null;
+            paused = false;
+            cleanupTemporary(ownedTemporary);
+            setState(false, false);
+            statusItem.hide();
+        };
+        proc.stderr.on('data', chunk => updateStatus(chunk.toString().replace(/\r/g, '\n').trim().split('\n').filter(Boolean).pop()));
+        proc.on('error', error => { if (activeProc === proc) vscode.window.showErrorMessage(`Kokoreader: ${error.message}`); finish(); });
+        proc.on('exit', finish);
         setState(true, false);
         statusItem.tooltip = 'Click to stop Kokoreader';
         statusItem.show();
@@ -96,14 +112,15 @@ function activate(context) {
         stop();
         const editor = vscode.window.activeTextEditor;
         const selection = editor && !editor.selection.isEmpty ? editor.document.getText(editor.selection) : '';
-        let file;
+        let file, temporary = null;
         if (selection) {
-            file = writeTemporaryText(selection);
+            temporary = writeTemporaryText(selection);
+            file = temporary.file;
         } else {
             file = uri ? uri.fsPath : editor && editor.document.uri.fsPath;
             if (!file) return vscode.window.showErrorMessage('Kokoreader: no file to read.');
         }
-        startReading(config, file, selection ? 'selection' : path.basename(file));
+        startReading(config, file, selection ? 'selection' : path.basename(file), temporary);
     });
 
     const cursorCommand = vscode.commands.registerCommand('kokoreader.readFromCursor', () => {
@@ -116,7 +133,8 @@ function activate(context) {
         const text = editor.document.getText(new vscode.Range(cursor, end));
         if (!text) return vscode.window.showInformationMessage('Kokoreader: cursor is at the end of the document.');
         stop();
-        startReading(config, writeTemporaryText(text), `cursor line ${cursor.line + 1}`);
+        const temporary = writeTemporaryText(text);
+        startReading(config, temporary.file, `cursor line ${cursor.line + 1}`, temporary);
     });
 
     const pauseCommand = vscode.commands.registerCommand('kokoreader.pause', () => {
@@ -145,6 +163,7 @@ function activate(context) {
         const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         item.text = `$(sync~spin) Kokoreader: saving ${path.basename(target.fsPath)}...`;
         item.show();
+        process.on('error', error => { item.dispose(); vscode.window.showErrorMessage(`Kokoreader: ${error.message}`); });
         process.on('exit', code => { item.dispose(); vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (exit ${code})`); });
     });
     context.subscriptions.push(readCommand, cursorCommand, pauseCommand, resumeCommand, stopCommand, saveCommand);

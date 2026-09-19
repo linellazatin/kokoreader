@@ -115,9 +115,12 @@ function parseArgs(argv, cfg) {
                 inputFile = arg;
         }
     }
-    for (const key of ['SPEED', 'TEMPO', 'GAIN', 'VOLUME', 'START_PARA']) {
+    for (const key of ['GAIN', 'VOLUME']) {
         if (!Number.isFinite(cfg[key])) throw new Error(`Invalid numeric value for ${key.toLowerCase()}`);
     }
+    if (!Number.isFinite(cfg.SPEED) || cfg.SPEED <= 0) throw new Error('speed must be greater than zero');
+    if (!Number.isFinite(cfg.TEMPO) || cfg.TEMPO < 0.5 || cfg.TEMPO > 100) throw new Error('tempo must be between 0.5 and 100');
+    if (!Number.isInteger(cfg.START_PARA) || cfg.START_PARA < 0) throw new Error('start-para must be a non-negative integer');
     if (!Number.isInteger(cfg.SAMPLE_RATE) || cfg.SAMPLE_RATE < 0) throw new Error('sample-rate must be a non-negative integer');
     if (!['wav', 'mp3', 'flac', 'opus'].includes(cfg.FORMAT)) throw new Error('format must be wav, mp3, flac, or opus');
     if (!Object.hasOwn(MODEL_FILES, cfg.MODEL_PRECISION)) throw new Error('model-precision must be fp32, fp16, or int8');
@@ -159,10 +162,14 @@ class Worker {
         });
         this.pending = new Map();
         this.nextId = 1;
+        this.exited = false;
         readline.createInterface({ input: this.proc.stdout }).on('line', line => this.receive(line));
         this.proc.stderr.on('data', chunk => { if (cfg.DEBUG) process.stderr.write(chunk); });
         this.proc.on('error', error => this.fail(error));
-        this.proc.on('exit', code => { if (code && this.pending.size) this.fail(new Error(`Kokoro worker exited with code ${code}`)); });
+        this.proc.on('exit', (code, signal) => {
+            this.exited = true;
+            if (this.pending.size) this.fail(new Error(code === null ? `Kokoro worker exited from ${signal || 'a signal'}` : `Kokoro worker exited with code ${code}`));
+        });
     }
     receive(line) {
         let message;
@@ -175,9 +182,19 @@ class Worker {
     fail(error) { for (const { reject } of this.pending.values()) reject(error); this.pending.clear(); }
     request(message) {
         return new Promise((resolve, reject) => {
+            if (this.exited || this.proc.stdin.destroyed || this.proc.stdin.writableEnded) return reject(new Error('Kokoro worker is not running'));
             const id = this.nextId++;
             this.pending.set(id, { resolve, reject });
-            this.proc.stdin.write(JSON.stringify({ id, ...message }) + '\n');
+            try {
+                this.proc.stdin.write(JSON.stringify({ id, ...message }) + '\n', error => {
+                    if (!error || !this.pending.has(id)) return;
+                    this.pending.delete(id);
+                    reject(error);
+                });
+            } catch (error) {
+                this.pending.delete(id);
+                reject(error);
+            }
         });
     }
     async synthesize(text, cfg) {
@@ -232,13 +249,23 @@ function ffmpegFilter(cfg) {
 
 function playPCM(pcm, sampleRate, cfg) {
     return new Promise((resolve, reject) => {
-        activeFfmpeg = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg), '-f', 'wav', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
-        activeFfplay = spawn('ffplay', ['-nodisp', '-autoexit', '-f', 'wav', '-i', 'pipe:0'], { stdio: ['pipe', 'ignore', 'ignore'] });
-        activeFfmpeg.stdin.end(pcm);
-        activeFfmpeg.stdout.pipe(activeFfplay.stdin);
-        activeFfmpeg.on('error', reject);
-        activeFfplay.on('error', reject);
-        activeFfplay.on('exit', () => { activeFfmpeg = activeFfplay = null; resolve(); });
+        const ffmpeg = activeFfmpeg = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg), '-f', 'wav', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
+        const ffplay = activeFfplay = spawn('ffplay', ['-nodisp', '-autoexit', '-f', 'wav', '-i', 'pipe:0'], { stdio: ['pipe', 'ignore', 'ignore'] });
+        let ffmpegDone = false, ffplayDone = false, settled = false;
+        const finish = error => {
+            if (settled) return;
+            settled = true;
+            if (error) { try { ffmpeg.kill(); } catch (_) {} try { ffplay.kill(); } catch (_) {} }
+            if (activeFfmpeg === ffmpeg) activeFfmpeg = null;
+            if (activeFfplay === ffplay) activeFfplay = null;
+            error ? reject(error) : resolve();
+        };
+        ffmpeg.stdin.end(pcm);
+        ffmpeg.stdout.pipe(ffplay.stdin);
+        ffmpeg.on('error', finish);
+        ffplay.on('error', finish);
+        ffmpeg.on('exit', code => { ffmpegDone = true; if (code !== 0) finish(new Error(`ffmpeg exited with code ${code}`)); else if (ffplayDone) finish(); });
+        ffplay.on('exit', code => { ffplayDone = true; if (code !== 0) finish(new Error(`ffplay exited with code ${code}`)); else if (ffmpegDone) finish(); });
     });
 }
 
@@ -246,7 +273,7 @@ function savePCM(raw, sampleRate, cfg) {
     return new Promise((resolve, reject) => {
         const args = ['-y', '-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg)];
         if (cfg.SAMPLE_RATE) args.push('-ar', String(cfg.SAMPLE_RATE));
-        args.push(cfg.OUTPUT_FILE);
+        args.push('-f', cfg.FORMAT, cfg.OUTPUT_FILE);
         const ffmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'ignore'] });
         ffmpeg.stdin.end(raw);
         ffmpeg.on('error', reject);
@@ -263,12 +290,13 @@ async function read(inputFile, cfg) {
     if (inputFile) setupIPC();
     const text = paragraphs(raw);
     if (!text.length) throw new Error('Nothing to read.');
+    if (cfg.START_PARA > text.length) throw new Error(`start-para must be no greater than the number of paragraphs (${text.length})`);
     const worker = activeWorker = new Worker(cfg);
     try {
         let sampleRate = null;
         const audio = [];
         for (let index = 0; index < text.length; index++) {
-            if (index + 1 <= cfg.START_PARA) continue;
+            if (cfg.START_PARA && index + 1 < cfg.START_PARA) continue;
             process.stderr.write(`\r[${index + 1}/${text.length}] synthesizing...`);
             const result = await worker.synthesize(text[index], cfg);
             sampleRate = sampleRate || result.sampleRate;
