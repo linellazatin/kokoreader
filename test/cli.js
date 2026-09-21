@@ -210,9 +210,12 @@ const child = spawn(process.execPath, [path.join(root, 'bin', 'kokoreader.js'), 
 child.stderr.resume();
 const cleanup = () => fs.rmSync(temp, { recursive: true, force: true });
 child.on('exit', code => { cleanup(); process.exit(code === 0 ? 0 : 2); });
-setTimeout(() => { child.kill(); cleanup(); process.exit(1); }, 1000);
+// The child must exit by itself even though the parent keeps the control pipe open.
+// The exit is the condition, so the timer only has to be long enough to call a hang a
+// hang: observed 277-460 ms for three Node spawns, with a cold first spawn past 1 s.
+setTimeout(() => { child.kill(); cleanup(); process.exit(1); }, 5000);
 `;
-    const result = spawnSync(process.execPath, ['-e', probe, ROOT], { cwd: ROOT, encoding: 'utf8', timeout: 5000 });
+    const result = spawnSync(process.execPath, ['-e', probe, ROOT], { cwd: ROOT, encoding: 'utf8', timeout: 10000 });
     assert(result.status === 0, `file-reading child did not exit: ${result.stderr}`);
 });
 
