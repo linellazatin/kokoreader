@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3
+
+- Fixed Pause and Resume losing the rest of a paragraph, and the stutter at the moment of Pause. `ffplay` cannot be paused in place: frozen, it stutters out the ~0.25 s of samples already handed to SDL and CoreAudio; continued, it burns the rest of its input at ~6x realtime (ffmpeg 9 on macOS) and exits. Pause now ends the paragraph's `ffmpeg`/`ffplay` pair, which mutes within ~10 ms, and Resume replays that paragraph from the remembered offset, `PAUSE_REWIND_MS` back, without re-synthesizing it.
+- Fixed a paragraph paused during synthesis being spawned and then frozen; it is now withheld until resume, which also removes the spawn-then-stop blip.
+- Fixed Pause doing nothing on Windows: the PowerShell `Suspend-Process`/`Resume-Process` cmdlets it shelled out to do not exist, and the failure was swallowed. Pause is now the same kill on every platform, with per-platform expectations documented in the Compatibility table. Only macOS is measured on hardware.
+- Added regression coverage for the withheld and the replayed paragraph, and made `KKR_STUB_FFPLAY_HOLD=1` keep a stub player alive so a paused paragraph is observable at all.
+
 ## 0.1.2
 
 - Fixed CLI signal handling: `SIGINT`, `SIGTERM`, and `SIGHUP` now run `killActive()` before exit, so the Python worker, `ffmpeg`, and `ffplay` no longer outlive the CLI and the extension's 500 ms fallback kill is safe.

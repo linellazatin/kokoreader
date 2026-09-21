@@ -28,9 +28,20 @@ Kokoreader reads text and Markdown aloud with local Kokoro inference. It provide
 | CPU | macOS Apple silicon or Intel, Windows x64, Linux x64 | Uses the CPU ONNX Runtime package. |
 | Linux ARM64 | Best effort | Matching Python and ONNX Runtime wheels must be available. |
 | Save to File | Any supported CLI platform with ffmpeg | No audio device or ffplay required. |
+| Pause / Resume | macOS verified, Linux and Windows expected | Ends the paragraph's player to mute and replays it on Resume. No platform suspend or mute API is involved. See the table below for what each platform sounds like. |
 | Remote/headless editor | Save to File, by default | Live playback requires an audio device where the extension host runs. |
 
-Windows pause/resume uses PowerShell. Kokoreader is not a mobile, browser, or web-extension tool.
+`ffplay` cannot be frozen in place, so Pause ends its `ffmpeg`/`ffplay` pair and Resume replays the same paragraph from a remembered offset. What that means per platform:
+
+| Platform | Mute | Click at Pause | Resume lands at |
+| --- | --- | --- | --- |
+| macOS | player exits 8-9 ms after the signal, measured | subtle, confirmed by ear | measured: the rest of the paragraph plays, nothing skipped |
+| Linux | same code path: `SIGTERM`, which SDL turns into a quit event that closes the audio device. Not measured. | not known | same arithmetic. Unmeasured: if PulseAudio, PipeWire, or ALSA owns more audio than the 0.8 s back-off, Resume skips that much instead of repeating it. Report it. |
+| Windows | same code path, but Node terminates the process abruptly instead of signalling it, so muting is at least as fast. Not measured. | expected to be the hardest of the three | same arithmetic. Pause did nothing at all before 0.1.3. |
+
+The character of the click belongs to the audio stack, not to Kokoreader. Only the macOS row has been checked on real hardware.
+
+Kokoreader is not a mobile, browser, or web-extension tool.
 
 ## Requirements
 
@@ -149,7 +160,7 @@ node bin/kokoreader.js README.md
 node bin/kokoreader.js --output README.wav README.md
 ```
 
-Expect paragraph progress. Kokoreader synthesizes each paragraph before playing it. With a file input, a controlling process can send `pause`, `resume`, and `stop` through stdin. With no file, stdin is text input:
+Expect paragraph progress. Kokoreader synthesizes each paragraph before playing it. With a file input, a controlling process can send `pause`, `resume`, and `stop` through stdin. `pause` ends the paragraph's player at once; `resume` replays that paragraph from where it was heard, backed off by about 0.8 s. With no file, stdin is text input:
 
 ```sh
 printf 'Hello from Kokoreader.\n' | node bin/kokoreader.js
@@ -187,7 +198,7 @@ Configure these editor settings:
 3. `kokoreader.modelPrecision`: `fp32` by default, or `fp16`/`int8` when the matching model asset was downloaded.
 4. Optionally set voice and playback controls below, and `kokoreader.debug` to reveal Python worker errors.
 
-Right-click an editor tab for **Read**, **Read From Cursor**, **Pause**, **Resume**, **Stop**, or **Save to File**. **Read** speaks the selection when one exists, otherwise the file. **Read From Cursor** ignores any selection and speaks from the exact active cursor position through the end of the current in-memory document, so it can start mid-word. **Save to File** uses `kokoreader.format` to select WAV, MP3, FLAC, or Opus. The status bar shows activity and stops active playback when clicked.
+Right-click an editor tab for **Read**, **Read From Cursor**, **Pause**, **Resume**, **Stop**, or **Save to File**. **Read** speaks the selection when one exists, otherwise the file. **Read From Cursor** ignores any selection and speaks from the exact active cursor position through the end of the current in-memory document, so it can start mid-word. **Save to File** uses `kokoreader.format` to select WAV, MP3, FLAC, or Opus. The status bar shows activity and stops active playback when clicked. **Pause** mutes at once and **Resume** replays the current paragraph from where it stopped, so a word or two can repeat.
 
 ## Voice quality and performance controls
 
@@ -259,6 +270,8 @@ Japanese and Mandarin are the weakest pairings: upstream trains them with misaki
 | `No module named 'kokoro_onnx'` | Install requirements with the exact configured interpreter. |
 | `model not found` | Run `--download` with `--model-dir`, or correct model paths. |
 | No audio | Verify `ffplay -version` and audio output. Try `--output test.wav` first. |
+| Resume repeats a word or two | Expected. `ffplay` cannot be paused in place, so Pause ends its player and Resume replays the paragraph from the remembered position, about 0.8 s back. |
+| A short click at Pause | Expected, and the point of ending the player: it replaces the word `ffplay` used to stutter out while frozen. Measured on macOS as subtle; expected to be most audible on Windows, where the process is terminated abruptly. |
 | `speed must be between 0.5 and 2.0` | Kokoro synthesis limit. Keep `speed` in range and use `tempo` for faster or slower playback. |
 | `lang "zh" is not supported by espeak-ng` | `--lang` takes espeak-ng codes, not Kokoro's: Mandarin is `cmn`, Cantonese is `yue`. Run `--list-languages` for the full set. |
 | `Kokoreader: espeak-ng cannot read ... (Latin dictionaries only)` | The text is not Latin script but `--lang` is a Latin-only code. Set `--lang` to the language of the text. |
