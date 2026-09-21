@@ -81,6 +81,7 @@ if (!sink) process.stdin.resume();
 const fs = require('fs');
 fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffplay', pid: process.pid }) + '\\n');
 if (process.env.KKR_STUB_FFPLAY_HOLD === '0') process.stdin.on('end', () => process.exit(0));
+if (process.env.KKR_STUB_FFPLAY_HOLD === '1') setInterval(() => {}, 1000);
 process.stdin.resume();
 `);
     for (const tool of ['ffmpeg', 'ffplay']) fs.chmodSync(path.join(paths.tools, tool), 0o755);
@@ -111,19 +112,8 @@ function waitFor(check, timeout = 5000) {
     }
 }
 
-// macOS and Linux both report a stopped process as state "T".
-function isStopped(pid) {
-    return /\bT/.test(spawnSync('ps', ['-o', 'state=', '-p', String(pid)], { encoding: 'utf8' }).stdout);
-}
-
 function isAlive(pid) {
     try { process.kill(pid, 0); return true; } catch (_) { return false; }
-}
-
-// Locate a spawned stub binary by path; only the real child carries it in argv.
-function stubPid(match) {
-    const out = spawnSync('pgrep', ['-f', match], { encoding: 'utf8' }).stdout.trim();
-    return out ? Number(out.split(/\s+/)[0]) : null;
 }
 
 function cliArgs(paths) {
@@ -210,9 +200,12 @@ const child = spawn(process.execPath, [path.join(root, 'bin', 'kokoreader.js'), 
 child.stderr.resume();
 const cleanup = () => fs.rmSync(temp, { recursive: true, force: true });
 child.on('exit', code => { cleanup(); process.exit(code === 0 ? 0 : 2); });
-setTimeout(() => { child.kill(); cleanup(); process.exit(1); }, 1000);
+// The child must exit by itself even though the parent keeps the control pipe open.
+// The exit is the condition, so the timer only has to be long enough to call a hang a
+// hang: observed 277-460 ms for three Node spawns, with a cold first spawn past 1 s.
+setTimeout(() => { child.kill(); cleanup(); process.exit(1); }, 5000);
 `;
-    const result = spawnSync(process.execPath, ['-e', probe, ROOT], { cwd: ROOT, encoding: 'utf8', timeout: 5000 });
+    const result = spawnSync(process.execPath, ['-e', probe, ROOT], { cwd: ROOT, encoding: 'utf8', timeout: 10000 });
     assert(result.status === 0, `file-reading child did not exit: ${result.stderr}`);
 });
 
@@ -348,22 +341,44 @@ run('CLI kills its worker when it is terminated by a signal', () => {
     }
 });
 
-run('pause during synthesis suspends the next paragraph instead of being dropped', () => {
+run('pause during synthesis withholds the next paragraph until resume', () => {
     const paths = stubs();
     const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
-        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400' },
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD: '1' },
     });
     child.stderr.resume();
     sleepSync(100);
     child.stdin.write('pause\n');
+    sleepSync(700);
     try {
-        // The stub is suspended before it can log, so find it by argv instead.
-        const player = waitFor(() => stubPid(path.join(paths.tools, 'ffplay')));
-        assert(player, 'ffplay never started');
-        assert(isStopped(player), `ffplay ${player} is playing although pause was requested during synthesis`);
+        assert(stubEvents(paths).filter(event => event.tool === 'ffplay').length === 0,
+            'a player started although pause was requested during synthesis');
         child.stdin.write('resume\n');
-        sleepSync(300);
-        assert(!isStopped(player), 'ffplay stayed stopped after resume');
+        assert(waitFor(() => stubEvents(paths).find(event => event.tool === 'ffplay')), 'resume never started the withheld paragraph');
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('pause cuts the player and resume replays the paragraph from the remembered offset', () => {
+    const paths = stubs();
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_FFPLAY_HOLD: '1' },
+    });
+    child.stderr.resume();
+    try {
+        const first = waitFor(() => stubEvents(paths).find(event => event.tool === 'ffplay'));
+        assert(first, 'ffplay never started');
+        child.stdin.write('pause\n');
+        assert(waitFor(() => (isAlive(first.pid) ? null : true)), `pause left ffplay ${first.pid} running`);
+        sleepSync(400);
+        const players = () => stubEvents(paths).filter(event => event.tool === 'ffplay').length;
+        assert(players() === 1, `the paragraph kept rolling while paused: ${players()} players`);
+        child.stdin.write('resume\n');
+        assert(waitFor(() => (players() > 1 ? true : null)), 'resume never replayed the paused paragraph');
+        const requests = stubEvents(paths).filter(event => event.action === 'synthesize');
+        assert(requests.length === 1, `resume re-synthesized the paragraph: ${requests.length} requests`);
     } finally {
         child.kill();
         fs.rmSync(paths.dir, { recursive: true, force: true });

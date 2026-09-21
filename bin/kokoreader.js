@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const https = require('https');
 const readline = require('readline');
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 
 const MODEL_FILES = {
     fp32: 'kokoro-v1.0.onnx',
@@ -245,12 +245,18 @@ let activeFfplay = null;
 let activeWorker = null;
 let activePartFile = null;
 let playbackPaused = false;
+// The live paragraph's mute, and the callbacks a `resume` has to wake: paragraphs
+// withheld before they started.
+let activePause = null;
+const onResume = new Set();
 
 function killActive() {
     for (const child of [activeWorker && activeWorker.proc, activeFfmpeg, activeFfplay]) {
         try { child && child.kill(); } catch (_) {}
     }
     activeFfmpeg = activeFfplay = activeWorker = null;
+    activePause = null;
+    onResume.clear();
     playbackPaused = false;
     // process.exit skips read()'s finally, so the in-flight encoder's temporary
     // file has to be reaped here or Ctrl-C and Stop litter the user's folder.
@@ -263,28 +269,16 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.on(signal, () => { killActive(); process.exit(128); });
 }
 
-function processControl(pid, verb) {
-    spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', `${verb}-Process -Id ${pid}`], { stdio: 'ignore' });
-}
-
-function suspendProcess(pid) {
-    if (process.platform === 'win32') return processControl(pid, 'Suspend');
-    try { process.kill(pid, 'SIGSTOP'); } catch (_) {}
-}
-
-function resumeProcess(pid) {
-    if (process.platform === 'win32') return processControl(pid, 'Resume');
-    try { process.kill(pid, 'SIGCONT'); } catch (_) {}
-}
-
 function pausePlayback() {
+    if (playbackPaused) return;
     playbackPaused = true;
-    if (activeFfplay) suspendProcess(activeFfplay.pid);
+    if (activePause) activePause();
 }
 
 function resumePlayback() {
+    if (!playbackPaused) return;
     playbackPaused = false;
-    if (activeFfplay) resumeProcess(activeFfplay.pid);
+    for (const wake of [...onResume]) { onResume.delete(wake); wake(); }
 }
 
 function setupIPC() {
@@ -302,33 +296,55 @@ function ffmpegFilter(cfg) {
     return filters.join(',');
 }
 
-function playPCM(pcm, sampleRate, cfg) {
+// Pause mutes by killing the paragraph's ffmpeg/ffplay pair (~10 ms to the audio device):
+// a frozen ffplay stutters out the ~0.25 s already handed to SDL and CoreAudio and, after
+// SIGCONT, burns its remaining input at ~6x realtime and exits. PAUSE_REWIND_MS is how far
+// back Resume replays, so a resume repeats a word rather than clipping one.
+const PAUSE_REWIND_MS = 800;
+
+async function playPCM(pcm, sampleRate, cfg) {
+    let offset = 0;
+    while (offset < pcm.length) {
+        while (playbackPaused) await new Promise(wake => onResume.add(wake));
+        offset = await playSegment(pcm, offset, sampleRate, cfg);
+    }
+}
+
+function playSegment(pcm, offset, sampleRate, cfg) {
     return new Promise((resolve, reject) => {
         const ffmpeg = activeFfmpeg = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg), '-f', 'wav', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
         const ffplay = activeFfplay = spawn('ffplay', ['-nodisp', '-autoexit', '-f', 'wav', '-i', 'pipe:0'], { stdio: ['pipe', 'ignore', 'ignore'] });
-        // The pause latch can be set while this paragraph was still synthesizing.
-        // ponytail: spawn-then-stop leaves a few ms of blip; Node cannot spawn
-        // suspended. Drop this once one long-lived player replaces per-paragraph ffplay.
-        if (playbackPaused) suspendProcess(ffplay.pid);
+        const started = Date.now();
         // A child that dies mid-stream makes its pipes emit EPIPE/ERR_STREAM_DESTROYED.
         // The 'exit' handlers already report the failure; this only stops an unhandled
         // stream error from replacing that report with a raw stack trace.
         for (const stream of [ffmpeg.stdin, ffmpeg.stdout, ffplay.stdin]) stream.on('error', () => {});
         let ffmpegDone = false, ffplayDone = false, settled = false;
-        const finish = error => {
+        const settle = (next, error) => {
             if (settled) return;
             settled = true;
-            if (error) { try { ffmpeg.kill(); } catch (_) {} try { ffplay.kill(); } catch (_) {} }
+            if (activePause === pause) activePause = null;
             if (activeFfmpeg === ffmpeg) activeFfmpeg = null;
             if (activeFfplay === ffplay) activeFfplay = null;
-            error ? reject(error) : resolve();
+            if (error) { try { ffmpeg.kill(); } catch (_) {} try { ffplay.kill(); } catch (_) {} }
+            error ? reject(error) : resolve(next);
         };
-        ffmpeg.stdin.end(pcm);
+        const pause = () => {
+            // s16le mono: sampleRate/500 bytes of the paragraph per millisecond of
+            // audio, scaled by atempo, which makes wall time and input bytes differ.
+            const heard = (Date.now() - started - PAUSE_REWIND_MS) * (sampleRate / 500) * cfg.TEMPO;
+            const next = Math.min(pcm.length, offset + Math.max(0, Math.trunc(heard / 2) * 2));
+            try { ffmpeg.kill(); } catch (_) {}
+            try { ffplay.kill(); } catch (_) {}
+            settle(next);
+        };
+        ffmpeg.stdin.end(pcm.subarray(offset));
         ffmpeg.stdout.pipe(ffplay.stdin);
-        ffmpeg.on('error', finish);
-        ffplay.on('error', finish);
-        ffmpeg.on('exit', code => { ffmpegDone = true; if (code !== 0) finish(new Error(`ffmpeg exited with code ${code}`)); else if (ffplayDone) finish(); });
-        ffplay.on('exit', code => { ffplayDone = true; if (code !== 0) finish(new Error(`ffplay exited with code ${code}`)); else if (ffmpegDone) finish(); });
+        ffmpeg.on('error', error => settle(0, error));
+        ffplay.on('error', error => settle(0, error));
+        ffmpeg.on('exit', code => { ffmpegDone = true; if (code !== 0) settle(0, new Error(`ffmpeg exited with code ${code}`)); else if (ffplayDone) settle(pcm.length); });
+        ffplay.on('exit', code => { ffplayDone = true; if (code !== 0) settle(0, new Error(`ffplay exited with code ${code}`)); else if (ffmpegDone) settle(pcm.length); });
+        activePause = pause;
     });
 }
 
