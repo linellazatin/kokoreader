@@ -1,7 +1,6 @@
-name: Validate and Release
+name: Re-validate and Release
 
 on:
-  pull_request:
   push:
     tags:
       - 'v*'

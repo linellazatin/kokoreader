@@ -1,0 +1,32 @@
+name: Validate
+
+on:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: Run tests
+        run: npm test
+
+      - name: Check runtime syntax
+        run: |
+          node --check bin/kokoreader.js
+          node --check extension/extension.js
+          python3 -m py_compile python/kokoro_worker.py
+
+      - name: Install vsce
+        run: npm install -g @vscode/vsce@4.0.0
+
+      - name: Package extension
+        run: vsce package --out kokoreader.vsix
