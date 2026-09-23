@@ -167,7 +167,7 @@ function requireAssets(cfg) {
 }
 
 function stripMarkdown(text) {
-    return text.replace(/^```[\s\S]*?^```\s*$/gm, '')
+    return text.replace(/^```[\s\S]*?^```\s*$/gm, '\n\nA code block follows. You can see the code in the document.\n\n')
         .replace(/`([^`]*)`/g, '$1').replace(/^[ \t]*#+[ \t]*/gm, '')
         .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
         .replace(/<\/?[a-zA-Z!][^>]*>/g, '').replace(/\*\*([^*]*)\*\*/g, '$1')
@@ -175,7 +175,17 @@ function stripMarkdown(text) {
         .replace(/^[ \t]*[-*=]{3,}[ \t]*$/gm, '').replace(/\n{3,}/g, '\n\n');
 }
 
-function paragraphs(text) { return stripMarkdown(text).split(/\n\n+/).map(x => x.trim()).filter(Boolean); }
+// Kokoro never learned a pause for dashes: espeak-ng drops spaced hyphens
+// outright and renders an em dash as a phoneme stretch with no silence, so
+// "a -- b" reads as "ab". A spaced dash is a spoken break, so hand the model
+// ".."  which it renders as a real ~170 ms pause. Word-internal hyphens
+// (local-first) stay joined. The lookbehind keeps dash-prefixed lines
+// (list bullets) untouched.
+function paragraphs(text) {
+    return stripMarkdown(text).split(/\n\n+/)
+        .map(x => x.trim().replace(/(?<=\S)[ \t]+[-–—]{1,}[ \t]+(?=\S)/g, ' .. '))
+        .filter(Boolean);
+}
 
 class Worker {
     constructor(cfg) {
@@ -221,9 +231,17 @@ class Worker {
             }
         });
     }
-    async synthesize(text, cfg) {
-        const response = await this.request({ action: 'synthesize', text, voice: cfg.VOICE, lang: cfg.LANG, speed: cfg.SPEED });
+    async prepare(text, cfg) {
+        const response = await this.request({ action: 'prepare', text, voice: cfg.VOICE, lang: cfg.LANG });
         if (response.warning) warnOnce(response.warning);
+        if (!Array.isArray(response.units) || !response.units.length) throw new Error('Kokoro worker prepared no synthesis units');
+        return response.units;
+    }
+    async synthesize(phonemes, cfg) {
+        const response = await this.request({ action: 'synthesize', phonemes, voice: cfg.VOICE, speed: cfg.SPEED });
+        if (typeof response.pcm !== 'string' || !Number.isFinite(response.sampleRate)) {
+            throw new Error('Kokoro worker returned an invalid synthesis response');
+        }
         return { pcm: Buffer.from(response.pcm, 'base64'), sampleRate: response.sampleRate };
     }
     async list() { return (await this.request({ action: 'list' })).voices; }
@@ -301,6 +319,9 @@ function ffmpegFilter(cfg) {
 // SIGCONT, burns its remaining input at ~6x realtime and exits. PAUSE_REWIND_MS is how far
 // back Resume replays, so a resume repeats a word rather than clipping one.
 const PAUSE_REWIND_MS = 800;
+const PARAGRAPH_PAUSE_MS = 800;
+
+function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function playPCM(pcm, sampleRate, cfg) {
     let offset = 0;
@@ -382,6 +403,39 @@ function readStdin() {
     return new Promise(resolve => { const chunks = []; process.stdin.on('data', x => chunks.push(x)); process.stdin.on('end', () => resolve(Buffer.concat(chunks).toString('utf8'))); });
 }
 
+async function* preparedUnits(text, cfg, worker) {
+    for (let index = 0; index < text.length; index++) {
+        if (cfg.START_PARA && index + 1 < cfg.START_PARA) continue;
+        process.stderr.write(`\r[${index + 1}/${text.length}] preparing...`);
+        for (const phonemes of await worker.prepare(text[index], cfg)) {
+            yield { phonemes, paragraph: index + 1, total: text.length };
+        }
+    }
+}
+
+async function playPreparedUnits(units, worker, cfg) {
+    const iterator = units[Symbol.asyncIterator]();
+    let current = await iterator.next();
+    if (current.done) return;
+    let currentAudio = await worker.synthesize(current.value.phonemes, cfg);
+    while (!current.done) {
+        process.stderr.write(`\r[${current.value.paragraph}/${current.value.total}] playing...     `);
+        const playing = playPCM(currentAudio.pcm, currentAudio.sampleRate, cfg);
+        const lookahead = (async () => {
+            while (playbackPaused) await new Promise(wake => onResume.add(wake));
+            const next = await iterator.next();
+            if (next.done) return { next, audio: null };
+            return { next, audio: await worker.synthesize(next.value.phonemes, cfg) };
+        })();
+        await playing;
+        const { next, audio } = await lookahead;
+        if (next.done) break;
+        if (next.value.paragraph !== current.value.paragraph) await delay(PARAGRAPH_PAUSE_MS);
+        current = next;
+        currentAudio = audio;
+    }
+}
+
 async function read(inputFile, cfg) {
     const raw = inputFile ? fs.readFileSync(inputFile, 'utf8') : await readStdin();
     if (inputFile) setupIPC();
@@ -391,19 +445,24 @@ async function read(inputFile, cfg) {
     const worker = activeWorker = new Worker(cfg);
     let saver = null;
     try {
-        for (let index = 0; index < text.length; index++) {
-            if (cfg.START_PARA && index + 1 < cfg.START_PARA) continue;
-            process.stderr.write(`\r[${index + 1}/${text.length}] synthesizing...`);
-            const result = await worker.synthesize(text[index], cfg);
-            if (cfg.OUTPUT_FILE) {
+        const units = preparedUnits(text, cfg, worker);
+        if (cfg.OUTPUT_FILE) {
+            let previousParagraph = 0;
+            for await (const unit of units) {
+                process.stderr.write(`\r[${unit.paragraph}/${unit.total}] synthesizing...`);
+                const result = await worker.synthesize(unit.phonemes, cfg);
                 if (!saver) saver = startSaveEncoder(cfg, result.sampleRate);
+                if (previousParagraph && unit.paragraph !== previousParagraph) {
+                    const bytes = Math.round(result.sampleRate * 2 * cfg.TEMPO * PARAGRAPH_PAUSE_MS / 1000);
+                    await new Promise((resolve, reject) => saver.stdin.write(Buffer.alloc(bytes), error => error ? reject(error) : resolve()));
+                }
                 // The write callback fires once flushed to the OS, which is the
-                // backpressure that keeps memory bounded to one paragraph.
+                // backpressure that keeps memory bounded to one synthesis unit.
                 await new Promise((resolve, reject) => saver.stdin.write(result.pcm, error => error ? reject(error) : resolve()));
-            } else {
-                process.stderr.write(`\r[${index + 1}/${text.length}] playing...     `);
-                await playPCM(result.pcm, result.sampleRate, cfg);
+                previousParagraph = unit.paragraph;
             }
+        } else {
+            await playPreparedUnits(units, worker, cfg);
         }
         if (saver) { saver.stdin.end(); await saver.done; }
         process.stderr.write('\n');

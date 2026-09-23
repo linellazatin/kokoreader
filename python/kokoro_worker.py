@@ -34,6 +34,43 @@ NON_LATIN = re.compile('[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff'
                        '\u0600-\u06ff\u0900-\u097f\u0e00-\u0e7f]')
 # Ordinary loss is a few percent (stress marks, spaces); Mandarin sits at 22%.
 DROP_WARN = 0.10
+SAFE_PHONEME_LENGTH = 500
+SENTENCE_BREAKS = frozenset('.!?…。！？')
+CLAUSE_BREAKS = frozenset(',;:،，；：')
+
+
+def split_phonemes(phonemes):
+    units = []
+    remaining = phonemes
+    while remaining:
+        if len(remaining) <= SAFE_PHONEME_LENGTH:
+            units.append(remaining)
+            break
+        prefix = remaining[:SAFE_PHONEME_LENGTH]
+        split_at = max((prefix.rfind(mark) + 1 for mark in SENTENCE_BREAKS), default=0)
+        if not split_at:
+            split_at = max((prefix.rfind(mark) + 1 for mark in CLAUSE_BREAKS), default=0)
+        if not split_at:
+            split_at = prefix.rfind(' ') + 1
+        if split_at <= 0:
+            split_at = SAFE_PHONEME_LENGTH
+        units.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    return [unit for unit in units if unit]
+
+
+def error_response(request_id, error, warning):
+    response = {'id': request_id, 'error': str(error)}
+    if warning:
+        response['warning'] = warning
+    return response
+
+
+def prepare(text, lang, tokenizer):
+    phonemes = tokenizer.phonemize(text, lang)
+    if not phonemes:
+        raise ValueError(f'lang "{lang}" produced no phonemes for this text; check the espeak-ng dictionary')
+    return split_phonemes(phonemes)
 
 
 def emit(message):
@@ -94,6 +131,7 @@ def main():
     for line in sys.stdin:
         request = json.loads(line)
         request_id = request.get('id')
+        warning = None
         try:
             if request['action'] == 'list':
                 emit({'id': request_id, 'voices': sorted(kokoro.get_voices())})
@@ -105,21 +143,24 @@ def main():
                       'kokoro': [{'letter': k, 'lang': VOICE_LANGS.get(k), 'voices': v}
                                  for k, v in sorted(counts.items())],
                       'espeak': names})
-            elif request['action'] == 'synthesize':
+            elif request['action'] == 'prepare':
                 check_lang(request['lang'], request['voice'], names)
                 warning = synth_warning(request['text'], request['lang'], kokoro.tokenizer, names)
-                samples, sample_rate = kokoro.create(
-                    request['text'], voice=request['voice'], speed=request['speed'], lang=request['lang']
-                )
-                response = {'id': request_id, 'sampleRate': sample_rate,
-                            'pcm': base64.b64encode(pcm16(samples)).decode('ascii')}
+                response = {'id': request_id,
+                            'units': prepare(request['text'], request['lang'], kokoro.tokenizer)}
                 if warning:
                     response['warning'] = warning
                 emit(response)
+            elif request['action'] == 'synthesize':
+                samples, sample_rate = kokoro.create(
+                    request['phonemes'], voice=request['voice'], speed=request['speed'], is_phonemes=True
+                )
+                emit({'id': request_id, 'sampleRate': sample_rate,
+                      'pcm': base64.b64encode(pcm16(samples)).decode('ascii')})
             else:
                 raise ValueError(f"unknown action: {request['action']}")
         except Exception as error:
-            emit({'id': request_id, 'error': str(error)})
+            emit(error_response(request_id, error, warning))
 
 
 def selfcheck():
@@ -131,6 +172,16 @@ def selfcheck():
     assert NON_LATIN.search('Hello 世界 world.')
     assert not NON_LATIN.search('Caffè Crème ñü ế')  # accented Latin is still Latin
     assert ''.join(dict.fromkeys(NON_LATIN.findall('世界 a 世界'))) == '世界'
+    assert split_phonemes('a' * 500) == ['a' * 500]
+    assert [len(unit) for unit in split_phonemes('a' * 501)] == [500, 1]
+    source = ('a' * 503) + ' b' + ('c' * 503)
+    units = split_phonemes(source)
+    assert ''.join(units) == source
+    assert all(0 < len(unit) <= SAFE_PHONEME_LENGTH for unit in units)
+    assert split_phonemes('a' * 490 + '. ' + 'b' * 20) == ['a' * 490 + '.', ' ' + 'b' * 20]
+    assert error_response(7, ValueError('bad'), 'language warning') == {
+        'id': 7, 'error': 'bad', 'warning': 'language warning'
+    }
     print('ok')
 
 

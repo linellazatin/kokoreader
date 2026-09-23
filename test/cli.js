@@ -51,9 +51,13 @@ const delay = Number(process.env.KKR_STUB_SYNTH_DELAY || 0);
 fs.appendFileSync(events, JSON.stringify({ tool: 'worker', pid: process.pid }) + '\\n');
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const request = JSON.parse(line);
-  fs.appendFileSync(events, line + '\\n');
+  fs.appendFileSync(events, JSON.stringify({ ...request, at: Date.now() }) + '\\n');
   const send = () => {
-    if (process.env.KKR_STUB_FAIL_TEXT && request.text.includes(process.env.KKR_STUB_FAIL_TEXT)) {
+    if (request.action === 'prepare') {
+      const units = process.env.KKR_STUB_UNITS ? JSON.parse(process.env.KKR_STUB_UNITS) : [request.text];
+      process.stdout.write(JSON.stringify({ id: request.id, units, warning: process.env.KKR_STUB_WARNING || undefined }) + '\\n');
+    } else if ((process.env.KKR_STUB_FAIL_TEXT && request.text && request.text.includes(process.env.KKR_STUB_FAIL_TEXT)) ||
+               (process.env.KKR_STUB_FAIL_PHONEMES && request.phonemes && request.phonemes.includes(process.env.KKR_STUB_FAIL_PHONEMES))) {
       process.stdout.write(JSON.stringify({ id: request.id, error: 'stub synthesis failed' }) + '\\n');
     } else if (request.action === 'languages') {
       process.stdout.write(JSON.stringify({ id: request.id,
@@ -73,15 +77,16 @@ const fs = require('fs');
 fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffmpeg', args: process.argv.slice(2) }) + '\\n');
 const out = process.argv[process.argv.length - 1];
 const sink = /^pipe:/.test(out) ? null : out;
-if (sink) process.stdin.on('data', chunk => fs.appendFileSync(sink, chunk));
+process.stdin.on('data', chunk => { if (sink) fs.appendFileSync(sink, chunk); else process.stdout.write(chunk); });
 process.stdin.on('end', () => process.exit(0));
-if (!sink) process.stdin.resume();
 `);
     fs.writeFileSync(path.join(paths.tools, 'ffplay'), `#!/usr/bin/env node
 const fs = require('fs');
-fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffplay', pid: process.pid }) + '\\n');
-if (process.env.KKR_STUB_FFPLAY_HOLD === '0') process.stdin.on('end', () => process.exit(0));
-if (process.env.KKR_STUB_FFPLAY_HOLD === '1') setInterval(() => {}, 1000);
+fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffplay', pid: process.pid, at: Date.now() }) + '\\n');
+const hold = Number(process.env.KKR_STUB_FFPLAY_HOLD_MS || 0);
+if (hold) setTimeout(() => { fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffplay-exit', pid: process.pid, at: Date.now() }) + '\\n'); process.exit(0); }, hold);
+else if (process.env.KKR_STUB_FFPLAY_HOLD === '0') process.stdin.on('end', () => process.exit(0));
+else if (process.env.KKR_STUB_FFPLAY_HOLD === '1') setInterval(() => {}, 1000);
 process.stdin.resume();
 `);
     for (const tool of ['ffmpeg', 'ffplay']) fs.chmodSync(path.join(paths.tools, tool), 0o755);
@@ -192,7 +197,7 @@ fs.mkdirSync(tools);
 fs.writeFileSync(input, 'A short selection.');
 fs.writeFileSync(model, 'model');
 fs.writeFileSync(voices, 'voices');
-fs.writeFileSync(worker, '#!/usr/bin/env node\nconst readline = require("readline");\nreadline.createInterface({ input: process.stdin }).on("line", line => { const { id } = JSON.parse(line); process.stdout.write(JSON.stringify({ id, pcm: "AAA=", sampleRate: 24000 }) + "\\n"); });\n');
+fs.writeFileSync(worker, '#!/usr/bin/env node\nconst readline = require("readline");\nreadline.createInterface({ input: process.stdin }).on("line", line => { const request = JSON.parse(line); const response = request.action === "prepare" ? { id: request.id, units: [request.text] } : { id: request.id, pcm: "AAA=", sampleRate: 24000 }; process.stdout.write(JSON.stringify(response) + "\\n"); });\n');
 fs.writeFileSync(path.join(tools, 'ffmpeg'), '#!/usr/bin/env node\nconst fs = require("fs");\nconst out = process.argv[process.argv.length - 1];\nif (out !== "pipe:1") process.stdin.on("data", c => fs.appendFileSync(out, c));\nprocess.stdin.on("end", () => process.exit(0));\n');
 fs.chmodSync(worker, 0o755);
 fs.chmodSync(path.join(tools, 'ffmpeg'), 0o755);
@@ -279,17 +284,29 @@ run('CLI loads its default config from the config directory', () => {
     assert(source.includes("path.join(__dirname, '..', 'config', 'kokoreader.conf')"), 'default config is not in config/kokoreader.conf');
 });
 
-run('GitHub workflow validates pull requests before packaging releases', () => {
-    const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
-    for (const fragment of ['pull_request:', "tags:\n      - 'v*'", 'permissions:\n      contents: read', 'npm test', 'node --check bin/kokoreader.js', 'python3 -m py_compile python/kokoro_worker.py', '@vscode/vsce@4.0.0', 'vsce package', 'needs: validate', 'publish release/kokoreader.vsix', 'softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65']) {
-        assert(workflow.includes(fragment), `missing workflow step: ${fragment}`);
+run('GitHub workflows validate pull requests separately from tagged releases', () => {
+    const validate = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'validate.yml'), 'utf8');
+    const release = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
+    for (const fragment of ['pull_request:', 'permissions:\n      contents: read', 'npm test', 'node --check bin/kokoreader.js', 'python3 -m py_compile python/kokoro_worker.py', '@vscode/vsce@4.0.0', 'vsce package']) {
+        assert(validate.includes(fragment), `missing PR validation step: ${fragment}`);
     }
+    assert(!validate.includes('actions/upload-artifact'), 'PR validation retains an unused artifact upload');
+    for (const fragment of ["tags:\n      - 'v*'", 'needs: validate', 'actions/upload-artifact', 'actions/download-artifact', 'publish release/kokoreader.vsix', 'softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65']) {
+        assert(release.includes(fragment), `missing release workflow step: ${fragment}`);
+    }
+    assert(!release.includes('pull_request:'), 'release workflow still handles pull requests');
 });
 
 run('GitHub Actions are pinned to immutable revisions', () => {
-    const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
-    for (const action of ['actions/checkout', 'actions/setup-node', 'actions/upload-artifact', 'actions/download-artifact', 'softprops/action-gh-release']) {
-        assert(new RegExp(`${action}@[0-9a-f]{40}`).test(workflow), `${action} is not pinned to a commit`);
+    const validate = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'validate.yml'), 'utf8');
+    const release = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
+    for (const [workflow, actions] of [
+        [validate, ['actions/checkout', 'actions/setup-node']],
+        [release, ['actions/checkout', 'actions/setup-node', 'actions/upload-artifact', 'actions/download-artifact', 'softprops/action-gh-release']],
+    ]) {
+        for (const action of actions) {
+            assert(new RegExp(`${action}@[0-9a-f]{40}`).test(workflow), `${action} is not pinned to a commit`);
+        }
     }
 });
 
@@ -378,7 +395,8 @@ run('pause cuts the player and resume replays the paragraph from the remembered 
         child.stdin.write('resume\n');
         assert(waitFor(() => (players() > 1 ? true : null)), 'resume never replayed the paused paragraph');
         const requests = stubEvents(paths).filter(event => event.action === 'synthesize');
-        assert(requests.length === 1, `resume re-synthesized the paragraph: ${requests.length} requests`);
+        assert(requests.filter(event => event.phonemes === 'First paragraph.').length === 1,
+            `resume re-synthesized the active unit: ${JSON.stringify(requests)}`);
     } finally {
         child.kill();
         fs.rmSync(paths.dir, { recursive: true, force: true });
@@ -431,8 +449,8 @@ run('save path streams each paragraph into one encoder without waiting for the d
             && fs.statSync(`${out}.part`).size === Buffer.from(STUB_PCM, 'base64').length) || null);
         assert(halfway, 'first paragraph never reached the encoder while the second was still synthesizing');
         assert(!fs.existsSync(out), 'final output was published before the document finished');
-        assert(waitFor(() => (fs.existsSync(out) && fs.statSync(out).size === 2 * Buffer.from(STUB_PCM, 'base64').length) || null, 8000),
-            'both paragraphs were never concatenated into the output');
+        assert(waitFor(() => (fs.existsSync(out) && fs.statSync(out).size === 2 * Buffer.from(STUB_PCM, 'base64').length + 24000 * 2 * 0.8) || null, 8000),
+            'both paragraphs and their 800 ms gap were never written to the output');
     } finally {
         child.kill();
         fs.rmSync(paths.dir, { recursive: true, force: true });
@@ -455,7 +473,7 @@ run('failed synthesis leaves the previous output file untouched', () => {
     const out = path.join(paths.dir, 'out.wav');
     fs.writeFileSync(out, 'previous');
     const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', out, paths.input],
-        { env: { ...process.env, ...stubEnv(paths), KKR_STUB_FAIL_TEXT: 'Second' } });
+        { env: { ...process.env, ...stubEnv(paths), KKR_STUB_FAIL_PHONEMES: 'Second' } });
     const untouched = fs.existsSync(out) && fs.readFileSync(out, 'utf8') === 'previous';
     const noPartial = !fs.existsSync(`${out}.part`);
     fs.rmSync(paths.dir, { recursive: true, force: true });
@@ -477,10 +495,110 @@ run('text comparisons are not mistaken for HTML tags', () => {
     const paths = stubs({ text: 'if x < 10 and y > 5 then stop.\n' });
     spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input],
         { env: { ...process.env, ...stubEnv(paths) } });
-    const synthesis = stubEvents(paths).find(event => event.action === 'synthesize');
+    const requests = stubEvents(paths).filter(event => event.action);
+    const prepared = requests.find(event => event.action === 'prepare');
+    const synthesized = requests.filter(event => event.action === 'synthesize');
     fs.rmSync(paths.dir, { recursive: true, force: true });
-    assert(synthesis, 'worker never received a synthesis request');
-    assert(synthesis.text === 'if x < 10 and y > 5 then stop.', `mangled input: ${JSON.stringify(synthesis.text)}`);
+    assert(prepared && prepared.text === 'if x < 10 and y > 5 then stop.', 'source text was not prepared');
+    assert(synthesized.length === 1, `expected one unit synthesis, saw ${synthesized.length}`);
+    assert(synthesized[0].phonemes === 'if x < 10 and y > 5 then stop.', 'prepared unit was not synthesized');
+});
+
+run('closed fenced code is replaced by a spoken marker', () => {
+    const paths = stubs({ text: 'Before.\n\n```js\nconst hidden = true;\n```\n\nAfter.\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'Before.', 'A code block follows. You can see the code in the document.', 'After.',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('spaced dashes become a pause Kokoro can render, compounds stay joined', () => {
+    const paths = stubs({ text: 'It just works — the agent reads.\n\nIt just works - the agent reads.\n\nIt just works -- the agent reads.\n\nIt is a local-first tool.\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input],
+        { env: { ...process.env, ...stubEnv(paths) } });
+    const requests = stubEvents(paths).filter(event => event.action === 'prepare');
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(requests.length === 4, `expected 4 paragraphs, saw ${requests.length}`);
+    assert(requests[0].text === 'It just works .. the agent reads.', `em dash not rewritten: ${JSON.stringify(requests[0].text)}`);
+    assert(requests[1].text === 'It just works .. the agent reads.', `hyphen not rewritten: ${JSON.stringify(requests[1].text)}`);
+    assert(requests[2].text === 'It just works .. the agent reads.', `double hyphen not rewritten: ${JSON.stringify(requests[2].text)}`);
+    assert(requests[3].text === 'It is a local-first tool.', `compound hyphen was rewritten: ${JSON.stringify(requests[3].text)}`);
+});
+
+run('worker prepares source text before synthesizing every safe unit', () => {
+    const paths = stubs({ text: 'One paragraph.\n' });
+    const out = path.join(paths.dir, 'out.wav');
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', out, paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_UNITS: JSON.stringify(['one', 'two']) },
+    });
+    const events = stubEvents(paths).filter(event => event.action);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(events.map(event => event.action)) === JSON.stringify(['prepare', 'synthesize', 'synthesize']),
+        `actions: ${JSON.stringify(events.map(event => event.action))}`);
+    assert(JSON.stringify(events.filter(event => event.action === 'synthesize').map(event => event.phonemes)) === JSON.stringify(['one', 'two']),
+        'prepared units were not synthesized in order');
+});
+
+run('live playback synthesizes the next unit before the current player exits', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '50', KKR_STUB_FFPLAY_HOLD_MS: '400' },
+    });
+    child.stderr.resume();
+    try {
+        assert(waitFor(() => {
+            const events = stubEvents(paths);
+            const firstPlay = events.find(event => event.tool === 'ffplay');
+            const firstExit = firstPlay && events.find(event => event.tool === 'ffplay-exit' && event.pid === firstPlay.pid);
+            const syntheses = events.filter(event => event.action === 'synthesize');
+            return firstExit && syntheses.length >= 2 ? { firstExit, syntheses } : null;
+        }), 'playback did not reach two synthesized units');
+        const events = stubEvents(paths);
+        const firstPlay = events.find(event => event.tool === 'ffplay');
+        const firstExit = events.find(event => event.tool === 'ffplay-exit' && event.pid === firstPlay.pid);
+        const syntheses = events.filter(event => event.action === 'synthesize');
+        assert(syntheses[1].at < firstExit.at, 'second unit was not synthesized while first unit played');
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('live playback leaves 800 ms between source paragraphs', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_FFPLAY_HOLD_MS: '100' },
+    });
+    child.stderr.resume();
+    try {
+        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'ffplay').length >= 2),
+            'second paragraph never began playback');
+        const plays = stubEvents(paths).filter(event => event.tool === 'ffplay');
+        const firstExit = stubEvents(paths).find(event => event.tool === 'ffplay-exit' && event.pid === plays[0].pid);
+        assert(firstExit && plays[1].at - firstExit.at >= 700,
+            `paragraph gap was ${plays[1].at - firstExit.at} ms, expected about 800 ms`);
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('saved audio includes 800 ms of silence between source paragraphs', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const out = path.join(paths.dir, 'out.wav');
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', out, paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const audio = fs.readFileSync(out);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status === 0, `save failed: ${result.stderr}`);
+    assert(audio.length === 2 * Buffer.from(STUB_PCM, 'base64').length + 24000 * 2 * 0.8,
+        `saved paragraph gap was not 800 ms: ${audio.length} bytes`);
+    assert(audio.subarray(8, 8 + 24000 * 2 * 0.8).every(byte => byte === 0), 'paragraph gap is not silent PCM');
 });
 
 run('config files cannot set run-mode keys', () => {
