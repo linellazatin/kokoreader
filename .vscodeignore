@@ -4,13 +4,21 @@ config/kokoreader.conf
 .gitignore
 .github
 *.vsix
+.DS_Store
 
-test/
-docs/
+## build caches
 __pycache__/
 **/__pycache__/**
 *model*/
 **/*.onnx
 **/*.bin
 **/*.download
+
+## non-essential locals
+test/
+docs/
+research*/
+
+## personal tools
 .nanomneme/
+.su*/
