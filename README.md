@@ -9,6 +9,44 @@
 
 Kokoreader reads text and Markdown aloud with local Kokoro inference. It provides a Node.js CLI and a VS Code/VSCodium extension for an editor tab or selection. Synthesis is local: no account, API key, or cloud service is used after one-time dependency and model downloads.
 
+## Main Features
+
+Kokoreader is built for reading real working documents aloud, not just short plain-text prompts.
+
+### Local by design
+
+Everything runs on your machine after the one-time model and dependency download. There is no account, API key, text upload, or cloud inference path.
+
+### Read where you work
+
+Use the CLI for files and pipelines, or use the VS Code/VSCodium extension to read an editor selection, a whole tab, or from the current cursor through the rest of the document. Save the same output as WAV, MP3, FLAC, or Opus when live playback is not practical.
+
+### Long-document playback that stays moving
+
+Kokoreader phonemizes text before synthesis, splits it safely below Kokoro’s model boundary, and keeps one upcoming unit synthesized while the current one plays. That avoids the long-paragraph bounds failure and reduces dead air caused by waiting for the next inference.
+
+It preserves a natural **800 ms** gap between source paragraphs in both live playback and saved audio, without adding pauses inside a paragraph that was safely split into multiple units.
+
+### Markdown-aware, without silently hiding structure
+
+Formatting, links, images, and HTML are removed before speech. Closed triple-backtick code blocks are skipped but announced:
+
+> "A code block follows. You can see the code in the document."
+
+That keeps a listener oriented without reading source code character by character.
+
+### Playback controls that respect listening
+
+Pause immediately ends the active player so audio stops rather than continuing in the background. Resume replays a short amount of context instead of skipping a word. Stop cancels live playback and active exports.
+
+### Language-aware guardrails
+
+Kokoreader exposes Kokoro voices and eSpeak language codes, validates selected languages before inference, and warns when script or phoneme coverage suggests likely pronunciation loss. This is particularly useful for mixed-language Markdown and non-Latin text.
+
+### Documentation-grade output
+
+Saved audio is streamed through one ffmpeg encoder, so long exports do not require buffering an entire document in memory. Output is written atomically: a failed export does not replace an existing finished file.
+
 ## Repository layout
 
 | Path | Contents |
@@ -160,7 +198,7 @@ node bin/kokoreader.js README.md
 node bin/kokoreader.js --output README.wav README.md
 ```
 
-Expect paragraph progress. Kokoreader synthesizes each paragraph before playing it. With a file input, a controlling process can send `pause`, `resume`, and `stop` through stdin. `pause` ends the paragraph's player at once; `resume` replays that paragraph from where it was heard, backed off by about 0.8 s. With no file, stdin is text input:
+Expect paragraph progress. Kokoreader phonemizes and splits each paragraph into safe units of at most 500 phonemes before synthesis. It synthesizes the first unit before playback, then synthesizes one upcoming unit while the current unit plays. It adds a natural 800 ms silent gap between source paragraphs in both live playback and saved audio, but not between safe units from the same paragraph. With a file input, a controlling process can send `pause`, `resume`, and `stop` through stdin. `pause` ends the paragraph's player at once; `resume` replays that paragraph from where it was heard, backed off by about 0.8 s. With no file, stdin is text input:
 
 ```sh
 printf 'Hello from Kokoreader.\n' | node bin/kokoreader.js
@@ -185,7 +223,13 @@ printf 'Hello from Kokoreader.\n' | node bin/kokoreader.js
 | `--force` | With `--download`, replace assets whose SHA-256 does not match the release. |
 | `-ls`, `--list`; `-ll`, `--list-languages`; `-dbg`, `--debug` | List voices, list accepted language codes, or show worker errors. |
 
-Input is plain text or Markdown. Formatting, links, images, fenced code blocks, and HTML tags are removed before synthesis.
+Input is plain text or Markdown. Formatting, links, images, and HTML tags are removed before synthesis. A closed triple-backtick fenced code block is skipped and replaced with the spoken paragraph:
+
+```text
+“A code block follows. You can see the code in the document.”
+```
+
+Inline code remains readable; tilde fences and unclosed fences retain their literal text.
 
 ## VS Code and VSCodium setup
 
@@ -227,14 +271,13 @@ Right-click an editor tab for **Read**, **Read From Cursor**, **Pause**, **Resum
 | Editor voice/language picker | Quick-pick settings | Viable. The worker already lists voices and language codes; the editor still needs the picker UI. |
 | Execution provider | CPU, CUDA, CoreML, DirectML, OpenVINO | Viable only with direct ONNX Runtime session control. The current worker uses the wrapper's default CPU provider. |
 | Thread counts | ONNX intra/inter-op limits | Viable only after direct session control. |
-| Prefetch/chunk size | Generation latency vs. memory | Viable; does not change model voice quality. |
 | Paragraph silence/fades | Gap and boundary behavior | Viable through ffmpeg. |
 
 Piper noise scales, speaker IDs, and phoneme-length scale have no Kokoro equivalent and should not be exposed.
 
 ### Languages, voices, and mismatch warnings
 
-`--lang` is an espeak-ng code, not Kokoro's documented language letter. `VOICE_LANGS` in `python/kokoro_worker.py` maps each Kokoro voice initial to the code its voices were trained for:
+`--lang` is an espeak-ng code, not Kokoro's documented language letter. Match it to the language of the text as well as the voice: Japanese text should use `--lang ja` and a `j`-initial Japanese voice. Safe chunking prevents the 510-phoneme bounds failure but cannot make Japanese pronounced through `en-us` sound correct. Mixed-language text is not automatically routed to multiple G2P pipelines. A punctuation-free run is hard-split without dropping text, which can make that boundary sound less natural. `VOICE_LANGS` in `python/kokoro_worker.py` maps each Kokoro voice initial to the code its voices were trained for:
 
 | Voice | Language | `--lang` |
 | --- | --- | --- |
