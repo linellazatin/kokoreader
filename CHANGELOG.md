@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.4
+
+### Added
+- Added one-unit live synthesis prefetch: while a unit plays, Kokoreader synthesizes its successor with the resident worker to reduce audible gaps without starting a second model worker.
+- Added an 800 ms silent gap between source paragraphs in live playback and saved audio; safe chunks from the same paragraph remain seamless.
+- Closed triple-backtick code blocks are now skipped with the spoken marker, “A code block follows. You can see the code in the document,” instead of disappearing silently.
+
+### Fixed
+- Fixed Kokoro's 510-phoneme bounds failure by phonemizing and splitting source paragraphs into ordered 500-phoneme safe units before inference, preserving punctuation-free text with a final hard split.
+- Fixed no pause at spaced dashes: espeak-ng drops spaced hyphens outright and Kokoro renders `—` as a stretch with no silence, so `works — the` read as `works the`. Spaced dashes (`-`, `--`, `–`, `—`) are now rewritten to `..` before synthesis, which the model renders as a real ~170 ms pause. Word-internal hyphens (`local-first`) and Markdown list bullets are untouched.
+
 ## 0.1.3
 
 - Fixed Pause and Resume losing the rest of a paragraph, and the stutter at the moment of Pause. `ffplay` cannot be paused in place: frozen, it stutters out the ~0.25 s of samples already handed to SDL and CoreAudio; continued, it burns the rest of its input at ~6x realtime (ffmpeg 9 on macOS) and exits. Pause now ends the paragraph's `ffmpeg`/`ffplay` pair, which mutes within ~10 ms, and Resume replays that paragraph from the remembered offset, `PAUSE_REWIND_MS` back, without re-synthesizing it.
