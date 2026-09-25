@@ -33,10 +33,14 @@ const ASSET_SHA256 = {
 const DEFAULTS = {
     MODEL_DIR: '', MODEL_PATH: '', VOICES_PATH: '', PYTHON_PATH: '',
     MODEL_PRECISION: 'fp32',
-    VOICE: 'af_heart', LANG: 'en-us', SPEED: 1, TEMPO: 1, GAIN: -1,
+    VOICE: 'af_heart', LANG: 'en-us', PROFILE: 'technical', SPEED: 1, TEMPO: 1, GAIN: -1,
     VOLUME: 1, FORMAT: 'wav', SAMPLE_RATE: 0, NORMALIZE: false, LIMITER: true,
     OUTPUT_FILE: '', START_PARA: 0, DEBUG: false, FORCE: false,
 };
+const VOICE_LANGS = Object.freeze({
+    a: 'en-us', b: 'en-gb', e: 'es', f: 'fr-fr', h: 'hi',
+    i: 'it', j: 'ja', p: 'pt-br', z: 'cmn',
+});
 
 const INSTALL_DIR = path.join(__dirname, '..');
 const PATH_CONFIG_KEYS = new Set(['MODEL_DIR', 'MODEL_PATH', 'VOICES_PATH']);
@@ -75,6 +79,7 @@ function usage() {
 `  -py, --python-path PATH    Python 3.11 or newer interpreter\n` +
 `  -v, --voice NAME           Kokoro voice (default: af_heart)\n` +
 `  -l, --lang CODE            Language code (default: en-us)\n` +
+`  -p, --profile NAME         narrative or technical (default: technical)\n` +
 `  -s, --speed N              Kokoro synthesis speed 0.5-2.0 (default: 1)\n\n` +
 `Playback:\n` +
 `  -t, --tempo N              Pitch-preserving playback speed (default: 1)\n` +
@@ -98,7 +103,7 @@ function usage() {
 }
 
 function parseArgs(argv, cfg) {
-    let inputFile = null, action = null;
+    let inputFile = null, action = null, explicitLanguage = false;
     const args = argv.slice(2);
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
@@ -114,7 +119,8 @@ function parseArgs(argv, cfg) {
             case '-mp': case '--model-precision': cfg.MODEL_PRECISION = value().toLowerCase(); break;
             case '-py': case '--python-path': cfg.PYTHON_PATH = value(); break;
             case '-v': case '--voice': cfg.VOICE = value(); break;
-            case '-l': case '--lang': cfg.LANG = value(); break;
+            case '-l': case '--lang': cfg.LANG = value(); explicitLanguage = true; break;
+            case '-p': case '--profile': cfg.PROFILE = value().toLowerCase(); break;
             case '-s': case '--speed': cfg.SPEED = Number(value()); break;
             case '-t': case '--tempo': cfg.TEMPO = Number(value()); break;
             case '-g': case '--gain': cfg.GAIN = Number(value()); break;
@@ -142,13 +148,14 @@ function parseArgs(argv, cfg) {
         if (!Number.isFinite(cfg[key])) throw new Error(`Invalid numeric value for ${key.toLowerCase()}`);
     }
     if (!Number.isFinite(cfg.SPEED) || cfg.SPEED < 0.5 || cfg.SPEED > 2) throw new Error('speed must be between 0.5 and 2.0');
+    if (!['narrative', 'technical'].includes(cfg.PROFILE)) throw new Error('profile must be narrative or technical');
     if (!Number.isFinite(cfg.TEMPO) || cfg.TEMPO < 0.5 || cfg.TEMPO > 100) throw new Error('tempo must be between 0.5 and 100');
     if (!Number.isInteger(cfg.START_PARA) || cfg.START_PARA < 0) throw new Error('start-para must be a non-negative integer');
     if (!Number.isInteger(cfg.SAMPLE_RATE) || cfg.SAMPLE_RATE < 0) throw new Error('sample-rate must be a non-negative integer');
     if (!['wav', 'mp3', 'flac', 'opus'].includes(cfg.FORMAT)) throw new Error('format must be wav, mp3, flac, or opus');
     if (!Object.hasOwn(MODEL_FILES, cfg.MODEL_PRECISION)) throw new Error('model-precision must be fp32, fp16, or int8');
     if (cfg.FORCE && action !== 'download') throw new Error('--force requires --download');
-    return { inputFile, action };
+    return { inputFile, action, filterVoicesByLanguage: action === 'list' && explicitLanguage };
 }
 
 function assets(cfg) {
@@ -166,13 +173,124 @@ function requireAssets(cfg) {
     return result;
 }
 
-function stripMarkdown(text) {
-    return text.replace(/^```[\s\S]*?^```\s*$/gm, '\n\nA code block follows. You can see the code in the document.\n\n')
+function normalizeTechnicalTokens(text) {
+    return normalizeCurrencies(text).replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/_/g, ' underscore ').replace(/\\/g, ' backslash ')
+        .replace(/\//g, ' slash ').replace(/-/g, ' dash ').replace(/\./g, ' dot ')
+        .replace(/[ \t]+/g, ' ').trim();
+}
+
+function normalizeCurrencies(text) {
+    const names = { '$': 'dollars', '€': 'euros', '£': 'pounds', '¥': 'yen' };
+    return text.replace(/([$€£¥])(\d+)\.(\d+)/g, (_, symbol, whole, fraction) =>
+        `${whole} point ${fraction} ${names[symbol]}`);
+}
+
+function normalizeDecimalPoints(text) {
+    return text.replace(/(?<=\d)\.(?=\d)/g, ' dot ');
+}
+
+const SPEECH_LABELS = Object.freeze({
+    'en-us': { code: 'The code is - ', codeBlock: 'A code block follows. You can see the code in the document.', table: 'Table.', columns: 'Columns:', row: n => `Row ${n}.`, column: n => `Column ${n}`, blank: 'blank', quote: 'Quote.', checked: 'Checked item.', unchecked: 'Unchecked item.', item: 'Item.', numbered: n => `Item ${n}.` },
+    'en-gb': { code: 'The code is - ', codeBlock: 'A code block follows. You can see the code in the document.', table: 'Table.', columns: 'Columns:', row: n => `Row ${n}.`, column: n => `Column ${n}`, blank: 'blank', quote: 'Quote.', checked: 'Checked item.', unchecked: 'Unchecked item.', item: 'Item.', numbered: n => `Item ${n}.` },
+    es: { code: 'El código es. ', codeBlock: 'Sigue un bloque de código. Puedes ver el código en el documento.', table: 'Tabla.', columns: 'Columnas:', row: n => `Fila ${n}.`, column: n => `Columna ${n}`, blank: 'vacío', quote: 'Cita.', checked: 'Elemento marcado.', unchecked: 'Elemento sin marcar.', item: 'Elemento.', numbered: n => `Elemento ${n}.` },
+    'fr-fr': { code: 'Le code est. ', codeBlock: 'Un bloc de code suit. Vous pouvez voir le code dans le document.', table: 'Tableau.', columns: 'Colonnes:', row: n => `Ligne ${n}.`, column: n => `Colonne ${n}`, blank: 'vide', quote: 'Citation.', checked: 'Élément coché.', unchecked: 'Élément non coché.', item: 'Élément.', numbered: n => `Élément ${n}.` },
+    hi: { code: 'कोड है। ', codeBlock: 'आगे एक कोड ब्लॉक है। आप दस्तावेज़ में कोड देख सकते हैं।', table: 'तालिका।', columns: 'स्तंभ:', row: n => `पंक्ति ${n}.`, column: n => `स्तंभ ${n}`, blank: 'खाली', quote: 'उद्धरण।', checked: 'चेक किया गया आइटम।', unchecked: 'अनचेक किया गया आइटम।', item: 'आइटम।', numbered: n => `आइटम ${n}.` },
+    it: { code: 'Il codice è. ', codeBlock: 'Segue un blocco di codice. Puoi vedere il codice nel documento.', table: 'Tabella.', columns: 'Colonne:', row: n => `Riga ${n}.`, column: n => `Colonna ${n}`, blank: 'vuoto', quote: 'Citazione.', checked: 'Elemento selezionato.', unchecked: 'Elemento non selezionato.', item: 'Elemento.', numbered: n => `Elemento ${n}.` },
+    ja: { code: 'コードです。 ', codeBlock: 'コードブロックが続きます。ドキュメントでコードを確認できます。', table: '表。', columns: '列:', row: n => `行 ${n}。`, column: n => `列 ${n}`, blank: '空欄', quote: '引用。', checked: 'チェック済みの項目。', unchecked: '未チェックの項目。', item: '項目。', numbered: n => `項目 ${n}。` },
+    'pt-br': { code: 'O código é. ', codeBlock: 'Segue um bloco de código. Você pode ver o código no documento.', table: 'Tabela.', columns: 'Colunas:', row: n => `Linha ${n}.`, column: n => `Coluna ${n}`, blank: 'em branco', quote: 'Citação.', checked: 'Item marcado.', unchecked: 'Item não marcado.', item: 'Item.', numbered: n => `Item ${n}.` },
+    cmn: { code: '代码是。 ', codeBlock: '接下来是代码块。您可以在文档中查看代码。', table: '表格。', columns: '列：', row: n => `第 ${n} 行。`, column: n => `第 ${n} 列`, blank: '空白', quote: '引用。', checked: '已选中项目。', unchecked: '未选中项目。', item: '项目。', numbered: n => `项目 ${n}。` },
+});
+
+function speechLabels(lang) {
+    return SPEECH_LABELS[lang] || SPEECH_LABELS['en-us'];
+}
+
+function tableCells(line) {
+    return line.trim().replace(/^\|/, '').replace(/\|$/, '')
+        .split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, '|'));
+}
+
+function isTableSeparator(line) {
+    const cells = tableCells(line);
+    return cells.length > 0 && cells.every(cell => /^:?-{3,}:?$/.test(cell));
+}
+
+function normalizeMarkdownTables(text, cfg) {
+    const speech = speechLabels(cfg.LANG);
+    const lines = text.split('\n');
+    const output = [];
+    for (let index = 0; index < lines.length; index++) {
+        const headers = tableCells(lines[index]);
+        if (!lines[index].includes('|') || !lines[index + 1] || !isTableSeparator(lines[index + 1]) ||
+            headers.length !== tableCells(lines[index + 1]).length) {
+            output.push(lines[index]);
+            continue;
+        }
+        const rows = [];
+        let end = index + 2;
+        while (end < lines.length && lines[end].includes('|') && lines[end].trim()) {
+            const cells = tableCells(lines[end]);
+            if (cells.length !== headers.length) break;
+            rows.push(cells);
+            end++;
+        }
+        if (end < lines.length && lines[end].includes('|') && lines[end].trim()) {
+            output.push(lines[index]);
+            continue;
+        }
+        const labels = headers.map((header, column) => header || speech.column(column + 1));
+        const spokenRows = [`${speech.table} ${speech.columns} ${labels.join(', ')}.`];
+        rows.forEach((cells, row) => spokenRows.push(`${speech.row(row + 1)} ${cells.map((cell, column) =>
+            `${labels[column]}: ${cell || speech.blank}.`).join(' ')}`));
+        output.push(spokenRows.join('\n\n'));
+        index = end - 1;
+    }
+    return output.join('\n');
+}
+
+function normalizeMarkdownStructure(text, cfg) {
+    const speech = speechLabels(cfg.LANG);
+    return text.split('\n').map(line => {
+        let content = line;
+        let quotes = 0;
+        let match;
+        while ((match = content.match(/^[ \t]*>\s?(.*)$/))) {
+            quotes++;
+            content = match[1];
+        }
+        content = content.replace(/^[ \t]*[-*+]\s+\[([ xX])\]\s+/, (_, marked) =>
+            /x/i.test(marked) ? `${speech.checked} ` : `${speech.unchecked} `)
+            .replace(/^[ \t]*[-*+]\s+/, `${speech.item} `)
+            .replace(/^[ \t]*(\d+)[.)]\s+/, (_, number) => `${speech.numbered(number)} `);
+        return `${`${speech.quote} `.repeat(quotes)}${content}`;
+    }).join('\n');
+}
+
+function stripMarkdown(text, cfg) {
+    const speech = speechLabels(cfg.LANG);
+    const inline = [];
+    const protectedInline = text.replace(/`([^`\n]+)`/g, (_, code) => {
+        const token = `\uE000${inline.length}\uE001`;
+        inline.push(normalizeTechnicalTokens(code));
+        return token;
+    });
+    const blocks = [];
+    const protectedBlocks = protectedInline.replace(/^```[^\n]*\n([\s\S]*?)^```\s*$/gm, (_, code) => {
+        const token = `\uE100${blocks.length}\uE101`;
+        blocks.push(cfg.PROFILE === 'technical' ? `\n\n${speech.code}${normalizeTechnicalTokens(code)}\n\n` :
+            `\n\n${speech.codeBlock}\n\n`);
+        return token;
+    });
+    const markdown = normalizeMarkdownStructure(normalizeMarkdownTables(protectedBlocks, cfg), cfg)
         .replace(/`([^`]*)`/g, '$1').replace(/^[ \t]*#+[ \t]*/gm, '')
         .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
         .replace(/<\/?[a-zA-Z!][^>]*>/g, '').replace(/\*\*([^*]*)\*\*/g, '$1')
         .replace(/__([^_]*)__/g, '$1').replace(/\*([^*]*)\*/g, '$1')
-        .replace(/^[ \t]*[-*=]{3,}[ \t]*$/gm, '').replace(/\n{3,}/g, '\n\n');
+        .replace(/^[ \t]*[-*=]{3,}[ \t]*$/gm, '').replace(/\n{3,}/g, '\n\n')
+        .replace(/\uE000(\d+)\uE001/g, (_, index) => inline[Number(index)])
+        .replace(/\uE100(\d+)\uE101/g, (_, index) => blocks[Number(index)]);
+    return normalizeDecimalPoints(normalizeCurrencies(markdown));
 }
 
 // Kokoro never learned a pause for dashes: espeak-ng drops spaced hyphens
@@ -181,9 +299,10 @@ function stripMarkdown(text) {
 // ".."  which it renders as a real ~170 ms pause. Word-internal hyphens
 // (local-first) stay joined. The lookbehind keeps dash-prefixed lines
 // (list bullets) untouched.
-function paragraphs(text) {
-    return stripMarkdown(text).split(/\n\n+/)
-        .map(x => x.trim().replace(/(?<=\S)[ \t]+[-–—]{1,}[ \t]+(?=\S)/g, ' .. '))
+function paragraphs(text, cfg) {
+    return stripMarkdown(text, cfg).split(/\n\n+/)
+        .map(x => x.trim().split('\n').map(line => isTableSeparator(line) ? line :
+            line.replace(/(?<=\S)[ \t]+[-–—]{1,}[ \t]+(?=\S)/g, ' .. ')).join('\n'))
         .filter(Boolean);
 }
 
@@ -439,7 +558,7 @@ async function playPreparedUnits(units, worker, cfg) {
 async function read(inputFile, cfg) {
     const raw = inputFile ? fs.readFileSync(inputFile, 'utf8') : await readStdin();
     if (inputFile) setupIPC();
-    const text = paragraphs(raw);
+    const text = paragraphs(raw, cfg);
     if (!text.length) throw new Error('Nothing to read.');
     if (cfg.START_PARA > text.length) throw new Error(`start-para must be no greater than the number of paragraphs (${text.length})`);
     const worker = activeWorker = new Worker(cfg);
@@ -553,7 +672,11 @@ async function main() {
     if (parsed.action === 'download') return downloadAssets(cfg);
     if (parsed.action === 'list') {
         const worker = new Worker(cfg);
-        try { for (const voice of await worker.list()) process.stdout.write(`${voice}\n`); }
+        try {
+            for (const voice of await worker.list()) {
+                if (!parsed.filterVoicesByLanguage || VOICE_LANGS[voice[0]] === cfg.LANG) process.stdout.write(`${voice}\n`);
+            }
+        }
         finally { worker.close(); }
         return;
     }

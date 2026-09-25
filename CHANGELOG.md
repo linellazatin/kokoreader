@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0
+
+### Added
+- Added reading profiles `technical` and `narrative`
+  - Added `-p` / `--profile` selection for the CLI, config file, and VS Code/VSCodium extension. Technical is the default and reads closed fenced code blocks; narrative preserves the fenced-code announcement.
+  - Technical profile added “The code is - ” before each closed fenced code block.
+  - Inline backtick code is read as technical tokens in either profile: `nmnm.jsonc` becomes “nmnm dot jsonc,” while camelCase, underscores, hyphens, and path separators receive spoken boundaries.
+- Speech-inserted Markdown labels follow `--lang` / `kokoreader.lang` for `en-us`, `en-gb`, `es`, `fr-fr`, `hi`, `it`, `ja`, `pt-br`, and `cmn`, with English fallback.
+- Compact numeric decimals are now read with “dot” in either profile, including versions such as `3.11`. Currency decimals use “point” plus a trailing name: `$3.50`, `€45.35`, `£1.00`, and `¥0.75` become “3 point 50 dollars,” “45 point 35 euros,” “1 point 00 pounds,” and “0 point 75 yen.”
+- Well-formed pipe tables are read as a column announcement followed by labeled data rows in both profiles; malformed tables remain source text.
+- Block quotes, task-list state, and list items now receive spoken structural markers; one-column pipe tables are accepted.
+- Added extension's dropdown for Kokoro-82M’s supported voice languages, and `--list --lang CODE` to show only installed voices matching a language while preserving manual CLI voice and language input.
+
+### Fixed
+- Fixed Read and Save to File in the extension to export the active editor’s current selection or document through a private temporary input, so unsaved edits are included and the temporary input is removed when the process completes or is stopped.
+- Fixed tab-context Read and Save actions selecting the active editor instead of their target tab; non-active targets now use their own URI.
+- Fixed overlapping exports being partly uncontrollable: only one Save to File export can run, Read and Save are unavailable while it runs, and Stop remains available to cancel it.
+- Fixed an open Save to File dialog leaving a private temporary input or later starting an export after Stop or deactivation; dialog cancellation now invalidates the pending save before input creation, and Command Palette reads cannot bypass the export guard.
+- Fixed Save to File dialog failures leaving editor commands disabled, and Command Palette Save starting alongside live reading.
+- Fixed blockquote task and ordered-list markers being lost after the quote announcement.
+
 ## 0.1.4
 
 ### Added

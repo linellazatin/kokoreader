@@ -8,6 +8,8 @@ VOICE=af_heart
 # LANG is an espeak-ng code, not Kokoro's language letter: Mandarin is cmn, not zh.
 # Run kokoreader --list-languages for the codes this install accepts.
 LANG=en-us
+PROFILE=technical
+# technical reads closed fenced code blocks; narrative announces them. Inline code is technical in both profiles.
 SPEED=1.0
 # SPEED must be between 0.5 and 2.0; use TEMPO for larger playback changes.
 TEMPO=1.0

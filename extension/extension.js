@@ -8,6 +8,9 @@ const path = require('path');
 
 let activeProc = null;
 let activeSave = null;
+let activeSaveTemporary = null;
+let pendingSave = false;
+let saveGeneration = 0;
 let statusItem = null;
 let paused = false;
 let activeTemporary = null;
@@ -15,6 +18,10 @@ let activeTemporary = null;
 function setState(playing, isPaused) {
     vscode.commands.executeCommand('setContext', 'kokoreader.isPlaying', playing);
     vscode.commands.executeCommand('setContext', 'kokoreader.isPaused', isPaused);
+}
+
+function setSaving(saving) {
+    vscode.commands.executeCommand('setContext', 'kokoreader.isSaving', saving);
 }
 
 function cleanupTemporary(temporary) {
@@ -30,12 +37,26 @@ function writeTemporaryText(text) {
     return { dir, file };
 }
 
+function inputForEditor(editor, uri) {
+    if (!editor || (uri && editor.document.uri.toString() !== uri.toString())) return null;
+    const text = editor.selection.isEmpty
+        ? editor.document.getText()
+        : editor.document.getText(editor.selection);
+    const temporary = writeTemporaryText(text);
+    return { file: temporary.file, temporary, name: path.basename(editor.document.fileName || 'kokoreader.txt') };
+}
+
+function hasEditorInput(editor, uri) {
+    return Boolean(editor && (!uri || editor.document.uri.toString() === uri.toString()));
+}
+
 function configArgs(config) {
     const args = [];
     const add = (flag, name) => { const value = config.get(name); if (typeof value !== 'boolean' && value !== '' && value != null) args.push(flag, String(value)); };
     const addBool = (enabled, disabled, name) => args.push(config.get(name) ? enabled : disabled);
     add('--model-dir', 'modelDir'); add('--model', 'modelPath'); add('--voices', 'voicesPath'); add('--model-precision', 'modelPrecision');
     add('--python-path', 'pythonPath'); add('--voice', 'voice'); add('--lang', 'lang');
+    add('--profile', 'profile');
     add('--speed', 'speed'); add('--tempo', 'tempo'); add('--gain', 'gain'); add('--volume', 'volume');
     add('--format', 'format'); add('--sample-rate', 'sampleRate');
     addBool('--normalize', '--no-normalize', 'normalize'); addBool('--limiter', '--no-limiter', 'limiter');
@@ -63,7 +84,13 @@ function spawnCli(args, options) {
 function stop() {
     paused = false;
     setState(false, false);
+    const saveTemporary = activeSaveTemporary;
+    activeSaveTemporary = null;
+    pendingSave = false;
+    saveGeneration++;
     if (activeSave) { try { activeSave.kill(); } catch (_) {} activeSave = null; }
+    setSaving(false);
+    cleanupTemporary(saveTemporary);
     const reader = activeProc;
     const temporary = activeTemporary;
     activeProc = null;
@@ -85,6 +112,7 @@ function activate(context) {
     statusItem.command = 'kokoreader.stop';
     context.subscriptions.push(statusItem);
     setState(false, false);
+    setSaving(false);
 
     function startReading(config, file, status, temporary = null) {
         updateStatus(status);
@@ -126,23 +154,18 @@ function activate(context) {
     const readCommand = vscode.commands.registerCommand('kokoreader.readFile', uri => {
         const config = vscode.workspace.getConfiguration('kokoreader');
         if (!validate(config)) return;
+        if (activeSave || pendingSave) return vscode.window.showInformationMessage('Kokoreader: stop the active export before reading.');
         stop();
         const editor = vscode.window.activeTextEditor;
-        const selection = editor && !editor.selection.isEmpty ? editor.document.getText(editor.selection) : '';
-        let file, temporary = null;
-        if (selection) {
-            temporary = writeTemporaryText(selection);
-            file = temporary.file;
-        } else {
-            file = uri ? uri.fsPath : editor && editor.document.uri.fsPath;
-            if (!file) return vscode.window.showErrorMessage('Kokoreader: no file to read.');
-        }
-        startReading(config, file, selection ? 'selection' : path.basename(file), temporary);
+        const input = inputForEditor(editor, uri) || (uri && uri.fsPath ? { file: uri.fsPath, temporary: null, name: path.basename(uri.fsPath) } : null);
+        if (!input) return vscode.window.showErrorMessage('Kokoreader: no file to read.');
+        startReading(config, input.file, editor && !editor.selection.isEmpty ? 'selection' : input.name, input.temporary);
     });
 
     const cursorCommand = vscode.commands.registerCommand('kokoreader.readFromCursor', () => {
         const config = vscode.workspace.getConfiguration('kokoreader');
         if (!validate(config)) return;
+        if (activeSave || pendingSave) return vscode.window.showInformationMessage('Kokoreader: stop the active export before reading.');
         const editor = vscode.window.activeTextEditor;
         if (!editor) return vscode.window.showErrorMessage('Kokoreader: no active editor.');
         const cursor = editor.selection.active;
@@ -167,18 +190,53 @@ function activate(context) {
     const saveCommand = vscode.commands.registerCommand('kokoreader.saveFile', async uri => {
         const config = vscode.workspace.getConfiguration('kokoreader');
         if (!validate(config)) return;
-        const file = uri ? uri.fsPath : vscode.window.activeTextEditor && vscode.window.activeTextEditor.document.uri.fsPath;
-        if (!file) return vscode.window.showErrorMessage('Kokoreader: no file to save.');
+        const editor = vscode.window.activeTextEditor;
+        if (activeSave || pendingSave) return vscode.window.showInformationMessage('Kokoreader: an export is already running.');
+        if (activeProc) return vscode.window.showInformationMessage('Kokoreader: stop the active reader before exporting.');
+        if (!hasEditorInput(editor, uri) && !(uri && uri.fsPath)) return vscode.window.showErrorMessage('Kokoreader: no file to save.');
         const format = config.get('format');
         const labels = { wav: 'WAV Audio', mp3: 'MP3 Audio', flac: 'FLAC Audio', opus: 'Opus Audio' };
-        const target = await vscode.window.showSaveDialog({
-            defaultUri: vscode.Uri.file(path.join(path.dirname(file), `${path.basename(file, path.extname(file))}.${format}`)),
-            filters: { [labels[format]]: [format] }, title: 'Save Kokoro audio as...'
-        });
-        if (!target) return;
-        const process = spawnCli([...configArgs(config), '--output', target.fsPath, file], { stdio: 'ignore' });
+        const sourcePath = uri && uri.fsPath ? uri.fsPath : editor && editor.document.uri.scheme === 'file' ? editor.document.uri.fsPath : null;
+        const generation = ++saveGeneration;
+        pendingSave = true;
+        setSaving(true);
+        let target;
+        try {
+            target = await vscode.window.showSaveDialog({
+                defaultUri: sourcePath ? vscode.Uri.file(path.join(path.dirname(sourcePath), `${path.basename(sourcePath, path.extname(sourcePath))}.${format}`)) : undefined,
+                filters: { [labels[format]]: [format] }, title: 'Save Kokoro audio as...'
+            });
+        } catch (error) {
+            if (generation !== saveGeneration) return;
+            pendingSave = false;
+            setSaving(false);
+            return vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
+        }
+        if (!pendingSave || generation !== saveGeneration) return;
+        pendingSave = false;
+        if (!target) { setSaving(false); return; }
+        let input;
+        try {
+            input = inputForEditor(editor, uri) || (uri && uri.fsPath ? { file: uri.fsPath, temporary: null, name: path.basename(uri.fsPath) } : null);
+        } catch (error) {
+            setSaving(false);
+            return vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
+        }
+        const process = spawnCli([...configArgs(config), '--output', target.fsPath, input.file], { stdio: 'ignore' });
         activeSave = process;
-        const clearSave = () => { if (activeSave === process) activeSave = null; };
+        activeSaveTemporary = input.temporary;
+        setSaving(true);
+        let cleaned = false;
+        const clearSave = () => {
+            if (cleaned) return;
+            cleaned = true;
+            cleanupTemporary(input.temporary);
+            if (activeSave === process) {
+                activeSave = null;
+                activeSaveTemporary = null;
+                setSaving(false);
+            }
+        };
         const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         item.text = `$(sync~spin) Kokoreader: saving ${path.basename(target.fsPath)}...`;
         item.show();

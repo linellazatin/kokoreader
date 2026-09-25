@@ -1,7 +1,9 @@
 'use strict';
 
 const { spawn, spawnSync } = require('child_process');
+const { EventEmitter } = require('events');
 const fs = require('fs');
+const Module = require('module');
 const os = require('os');
 const path = require('path');
 
@@ -9,14 +11,65 @@ const ROOT = path.resolve(__dirname, '..');
 const CLI = path.join(ROOT, 'bin', 'kokoreader.js');
 let passed = 0;
 let failed = 0;
+const pending = [];
 
 function run(label, fn) {
-    try { fn(); console.log(`PASS ${label}`); passed++; }
-    catch (error) { console.error(`FAIL ${label}: ${error.message}`); failed++; }
+    try {
+        const result = fn();
+        if (result && typeof result.then === 'function') {
+            pending.push(result.then(() => { console.log(`PASS ${label}`); passed++; }, error => {
+                console.error(`FAIL ${label}: ${error.message}`); failed++;
+            }));
+        } else { console.log(`PASS ${label}`); passed++; }
+    } catch (error) { console.error(`FAIL ${label}: ${error.message}`); failed++; }
 }
 
 function assert(condition, message) {
     if (!condition) throw new Error(message);
+}
+
+function extensionHarness(activeEditor, options = {}) {
+    const commands = new Map();
+    const spawned = [];
+    const contexts = [];
+    const errors = [];
+    const uri = file => ({ fsPath: file, scheme: 'file', toString: () => `file://${file}` });
+    const vscode = {
+        StatusBarAlignment: { Left: 1 },
+        Uri: { file: uri },
+        commands: {
+            executeCommand(...args) { contexts.push(args); },
+            registerCommand(name, handler) { commands.set(name, handler); return { dispose() {} }; },
+        },
+        workspace: { getConfiguration: () => ({ get: name => ({ pythonPath: '/python', modelDir: '/models', format: 'wav' }[name]) }) },
+        window: {
+            activeTextEditor: activeEditor,
+            createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
+            showSaveDialog: options.showSaveDialog || (async () => uri('/tmp/kokoreader-output.wav')),
+            showErrorMessage(message) { errors.push(message); }, showInformationMessage() {},
+        },
+    };
+    const originalLoad = Module._load;
+    const extensionPath = path.join(ROOT, 'extension', 'extension.js');
+    delete require.cache[extensionPath];
+    Module._load = function(request, parent, isMain) {
+        if (request === 'vscode') return vscode;
+        if (request === 'child_process') return { spawn: (command, args, options) => {
+            const child = new EventEmitter();
+            child.stdin = { write() {} }; child.stderr = new EventEmitter(); child.kill = () => {};
+            spawned.push({ command, args, options, child });
+            return child;
+        } };
+        return originalLoad.call(this, request, parent, isMain);
+    };
+    try {
+        const extension = require(extensionPath);
+        extension.activate({ subscriptions: { push() {} } });
+        return { commands, spawned, contexts, errors, extension, uri };
+    } finally {
+        Module._load = originalLoad;
+        delete require.cache[extensionPath];
+    }
 }
 
 function cli(args, options = {}) {
@@ -143,9 +196,25 @@ run('--help exposes output processing controls', () => {
 run('--help exposes compact aliases and model precision', () => {
     const result = cli(['--help']);
     assert(result.status === 0, `exit ${result.status}: ${result.stderr}`);
-    for (const option of ['-md', '-mp', '--model-precision', '-sr', '-lim']) {
+    for (const option of ['-md', '-mp', '--model-precision', '-sr', '-lim', '-p', '--profile']) {
         assert(result.stdout.includes(option), `missing ${option}`);
     }
+});
+
+run('--list filters installed voices when --lang is explicit', () => {
+    const paths = stubs();
+    const english = cli([...cliArgs(paths), '--list', '--lang', 'en-us'], { env: stubEnv(paths) });
+    const british = cli([...cliArgs(paths), '--list', '--lang', 'en-gb'], { env: stubEnv(paths) });
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(english.status === 0 && english.stdout.trim() === 'af_heart', `en-us voices: ${english.stdout}`);
+    assert(british.status === 0 && british.stdout.trim() === '', `en-gb voices: ${british.stdout}`);
+});
+
+run('extension language setting offers the supported Kokoro voice languages', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    const language = manifest.contributes.configuration.properties['kokoreader.lang'];
+    assert(JSON.stringify(language.enum) === JSON.stringify(['en-us', 'en-gb', 'es', 'fr-fr', 'hi', 'it', 'ja', 'pt-br', 'cmn']),
+        `language enum: ${JSON.stringify(language.enum)}`);
 });
 
 run('invalid model precision is rejected before download', () => {
@@ -264,7 +333,7 @@ run('extension settings have an intentional setup-to-output order', () => {
     const settings = manifest.contributes.configuration.properties;
     const ordered = [
         'kokoreader.pythonPath', 'kokoreader.modelDir', 'kokoreader.modelPath', 'kokoreader.voicesPath', 'kokoreader.modelPrecision',
-        'kokoreader.voice', 'kokoreader.lang', 'kokoreader.speed',
+        'kokoreader.voice', 'kokoreader.lang', 'kokoreader.profile', 'kokoreader.speed',
         'kokoreader.tempo', 'kokoreader.gain', 'kokoreader.volume',
         'kokoreader.format', 'kokoreader.sampleRate', 'kokoreader.normalize', 'kokoreader.limiter'
     ];
@@ -410,7 +479,7 @@ run('extension reports a failed reader exit and can surface worker errors', () =
     assert(source.includes('Kokoreader: reader failed'), 'failed reader exit is not shown to the user');
     assert(source.includes("lastLine.indexOf('Error: ')"), 'error detail is parsed only from the start of a line the progress text shares');
     assert(source.includes("'--debug'"), 'worker debug output cannot be forwarded');
-    assert(manifest.contributes.configuration.properties['kokoreader.debug'].order === 16, 'debug setting is not ordered last');
+    assert(manifest.contributes.configuration.properties['kokoreader.debug'].order === 17, 'debug setting is not ordered last');
 });
 
 run('relative model paths from a config file resolve against the install directory', () => {
@@ -504,7 +573,7 @@ run('text comparisons are not mistaken for HTML tags', () => {
     assert(synthesized[0].phonemes === 'if x < 10 and y > 5 then stop.', 'prepared unit was not synthesized');
 });
 
-run('closed fenced code is replaced by a spoken marker', () => {
+run('technical is the default profile for closed fenced code', () => {
     const paths = stubs({ text: 'Before.\n\n```js\nconst hidden = true;\n```\n\nAfter.\n' });
     spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
         env: { ...process.env, ...stubEnv(paths) },
@@ -512,8 +581,288 @@ run('closed fenced code is replaced by a spoken marker', () => {
     const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
     fs.rmSync(paths.dir, { recursive: true, force: true });
     assert(JSON.stringify(prepared) === JSON.stringify([
-        'Before.', 'A code block follows. You can see the code in the document.', 'After.',
+        'Before.', 'The code is .. const hidden = true;', 'After.',
     ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('narrative mode normalizes inline code as technical tokens', () => {
+    const paths = stubs({ text: 'Use `nmnm.jsonc` and `camelCase_path/file-name`.\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '-p', 'narrative', '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'Use nmnm dot jsonc and camel Case underscore path slash file dash name.',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('both profiles pronounce compact decimal numbers with dot', () => {
+    for (const profile of ['narrative', 'technical']) {
+        const paths = stubs({ text: 'Python 3.11 costs $3.50.\n' });
+        spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--profile', profile, '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+            env: { ...process.env, ...stubEnv(paths) },
+        });
+        const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+        assert(JSON.stringify(prepared) === JSON.stringify(['Python 3 dot 11 costs 3 point 50 dollars.']),
+            `${profile} prepared text: ${JSON.stringify(prepared)}`);
+    }
+});
+
+run('both profiles normalize currency decimals with a trailing currency name', () => {
+    for (const profile of ['narrative', 'technical']) {
+        const paths = stubs({ text: '$3.50 €45.35 £1.00 ¥0.75 and version 3.11.\n' });
+        spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--profile', profile, '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+            env: { ...process.env, ...stubEnv(paths) },
+        });
+        const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+        assert(JSON.stringify(prepared) === JSON.stringify([
+            '3 point 50 dollars 45 point 35 euros 1 point 00 pounds 0 point 75 yen and version 3 dot 11.',
+        ]), `${profile} prepared text: ${JSON.stringify(prepared)}`);
+    }
+});
+
+run('both profiles read GFM tables as labeled rows', () => {
+    for (const profile of ['narrative', 'technical']) {
+        const paths = stubs({ text: '| Name | Value |\n| :--- | ---: |\n| alpha | 3.11 |\n| beta | |\n\nAfter.\n' });
+        spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--profile', profile, '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+            env: { ...process.env, ...stubEnv(paths) },
+        });
+        const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+        assert(JSON.stringify(prepared) === JSON.stringify([
+            'Table. Columns: Name, Value.',
+            'Row 1. Name: alpha. Value: 3 dot 11.',
+            'Row 2. Name: beta. Value: blank.',
+            'After.',
+        ]), `${profile} prepared text: ${JSON.stringify(prepared)}`);
+    }
+});
+
+run('one-column GFM tables are read as labeled rows', () => {
+    const paths = stubs({ text: '| Status |\n| --- |\n| ready |\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'Table. Columns: Status.', 'Row 1. Status: ready.',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('block quotes and task lists receive structural speech markers', () => {
+    const paths = stubs({ text: '> Quoted text.\n\n- [ ] Draft task.\n- [x] Finished task.\n- Plain item.\n1. Numbered item.\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'Quote. Quoted text.',
+        'Unchecked item. Draft task.\nChecked item. Finished task.\nItem. Plain item.\nItem 1. Numbered item.',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('nested task lists inside block quotes retain both speech markers', () => {
+    const paths = stubs({ text: '> - [ ] Draft task.\n> 1. Numbered task.\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'Quote. Unchecked item. Draft task.\nQuote. Item 1. Numbered task.',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('supported voice languages localize inserted Markdown speech labels', () => {
+    const expected = {
+        'en-us': ['The code is .. x', 'Table. Columns: H.', 'Row 1. H: blank.', 'Quote. q.', 'Checked item. c.\nUnchecked item. u.\nItem. p.\nItem 1. n.', 'A code block follows. You can see the code in the document.'],
+        'en-gb': ['The code is .. x', 'Table. Columns: H.', 'Row 1. H: blank.', 'Quote. q.', 'Checked item. c.\nUnchecked item. u.\nItem. p.\nItem 1. n.', 'A code block follows. You can see the code in the document.'],
+        es: ['El código es. x', 'Tabla. Columnas: H.', 'Fila 1. H: vacío.', 'Cita. q.', 'Elemento marcado. c.\nElemento sin marcar. u.\nElemento. p.\nElemento 1. n.', 'Sigue un bloque de código. Puedes ver el código en el documento.'],
+        'fr-fr': ['Le code est. x', 'Tableau. Colonnes: H.', 'Ligne 1. H: vide.', 'Citation. q.', 'Élément coché. c.\nÉlément non coché. u.\nÉlément. p.\nÉlément 1. n.', 'Un bloc de code suit. Vous pouvez voir le code dans le document.'],
+        hi: ['कोड है। x', 'तालिका। स्तंभ: H.', 'पंक्ति 1. H: खाली.', 'उद्धरण। q.', 'चेक किया गया आइटम। c.\nअनचेक किया गया आइटम। u.\nआइटम। p.\nआइटम 1. n.', 'आगे एक कोड ब्लॉक है। आप दस्तावेज़ में कोड देख सकते हैं।'],
+        it: ['Il codice è. x', 'Tabella. Colonne: H.', 'Riga 1. H: vuoto.', 'Citazione. q.', 'Elemento selezionato. c.\nElemento non selezionato. u.\nElemento. p.\nElemento 1. n.', 'Segue un blocco di codice. Puoi vedere il codice nel documento.'],
+        ja: ['コードです。 x', '表。 列: H.', '行 1。 H: 空欄.', '引用。 q.', 'チェック済みの項目。 c.\n未チェックの項目。 u.\n項目。 p.\n項目 1。 n.', 'コードブロックが続きます。ドキュメントでコードを確認できます。'],
+        'pt-br': ['O código é. x', 'Tabela. Colunas: H.', 'Linha 1. H: em branco.', 'Citação. q.', 'Item marcado. c.\nItem não marcado. u.\nItem. p.\nItem 1. n.', 'Segue um bloco de código. Você pode ver o código no documento.'],
+        cmn: ['代码是。 x', '表格。 列： H.', '第 1 行。 H: 空白.', '引用。 q.', '已选中项目。 c.\n未选中项目。 u.\n项目。 p.\n项目 1。 n.', '接下来是代码块。您可以在文档中查看代码。'],
+    };
+    const text = '```text\nx\n```\n\n| H |\n| --- |\n| |\n\n> q.\n\n- [x] c.\n- [ ] u.\n- p.\n1. n.\n';
+    for (const [lang, labels] of Object.entries(expected)) {
+        const technical = stubs({ text });
+        spawnSync(process.execPath, [CLI, ...cliArgs(technical), '--lang', lang, '--output', path.join(technical.dir, 'o.wav'), technical.input], {
+            env: { ...process.env, ...stubEnv(technical) },
+        });
+        const prepared = stubEvents(technical).filter(event => event.action === 'prepare').map(event => event.text);
+        fs.rmSync(technical.dir, { recursive: true, force: true });
+        assert(JSON.stringify(prepared) === JSON.stringify(labels.slice(0, 5)), `${lang} technical labels: ${JSON.stringify(prepared)}`);
+
+        const narrative = stubs({ text: '```text\nx\n```\n' });
+        spawnSync(process.execPath, [CLI, ...cliArgs(narrative), '--lang', lang, '--profile', 'narrative', '--output', path.join(narrative.dir, 'o.wav'), narrative.input], {
+            env: { ...process.env, ...stubEnv(narrative) },
+        });
+        const announcement = stubEvents(narrative).filter(event => event.action === 'prepare').map(event => event.text);
+        fs.rmSync(narrative.dir, { recursive: true, force: true });
+        assert(JSON.stringify(announcement) === JSON.stringify([labels[5]]), `${lang} narrative label: ${JSON.stringify(announcement)}`);
+    }
+});
+
+run('extension saves current editor text through private temporary input', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
+    assert(source.includes('function inputForEditor('), 'extension has no shared editor-input resolver');
+    assert(source.includes('editor.document.getText(editor.selection)'), 'Save to File cannot use an active selection');
+    assert(source.includes('editor.document.getText()'), 'Save to File cannot use unsaved editor content');
+    assert(source.includes('activeSaveTemporary'), 'Save to File temporary input is not lifecycle-managed');
+});
+
+run('extension Read honors a context-menu target over another active editor', () => {
+    const activePath = '/tmp/kokoreader-active.md';
+    const targetPath = '/tmp/kokoreader-target.md';
+    const active = {
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: activePath, scheme: 'file', toString: () => `file://${activePath}` }, fileName: activePath, getText: () => 'unsaved active text' },
+    };
+    const harness = extensionHarness(active);
+    const target = harness.uri(targetPath);
+    harness.commands.get('kokoreader.readFile')(target);
+    const inputs = harness.spawned.map(call => call.args.at(-1));
+    harness.extension.deactivate();
+    assert(JSON.stringify(inputs) === JSON.stringify([targetPath]), `wrong command input: ${JSON.stringify(inputs)}`);
+});
+
+run('extension exposes saving context so concurrent exports are unavailable', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    const save = manifest.contributes.menus['editor/title/context'].find(item => item.command === 'kokoreader.saveFile');
+    const stop = manifest.contributes.menus['editor/title/context'].find(item => item.command === 'kokoreader.stop');
+    assert(save.when.includes('!kokoreader.isSaving'), `save menu condition: ${save.when}`);
+    assert(stop.when.includes('kokoreader.isSaving'), `stop menu condition: ${stop.when}`);
+});
+
+run('extension cancels a pending Save dialog before creating input or spawning', async () => {
+    const sourcePath = '/tmp/kokoreader-pending.md';
+    let resolveDialog;
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'unsaved text' },
+    }, { showSaveDialog: () => new Promise(resolve => { resolveDialog = resolve; }) });
+    const save = harness.commands.get('kokoreader.saveFile')();
+    harness.extension.deactivate();
+    resolveDialog(harness.uri('/tmp/kokoreader-output.wav'));
+    await save;
+    assert(harness.spawned.length === 0, `spawned after cancellation: ${harness.spawned.length}`);
+});
+
+run('extension commands cannot replace an active export through the Command Palette', async () => {
+    const sourcePath = '/tmp/kokoreader-export.md';
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'unsaved text' },
+    });
+    await harness.commands.get('kokoreader.saveFile')();
+    harness.commands.get('kokoreader.readFile')();
+    harness.commands.get('kokoreader.readFromCursor')();
+    harness.extension.deactivate();
+    assert(harness.spawned.length === 1, `commands replaced export with ${harness.spawned.length} processes`);
+});
+
+run('extension clears saving state when the Save dialog rejects', async () => {
+    const sourcePath = '/tmp/kokoreader-dialog-error.md';
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'unsaved text' },
+    }, { showSaveDialog: async () => { throw new Error('dialog unavailable'); } });
+    await harness.commands.get('kokoreader.saveFile')();
+    assert(harness.contexts.some(args => args[0] === 'setContext' && args[1] === 'kokoreader.isSaving' && args[2] === false), 'saving context was not cleared');
+    assert(harness.errors.some(message => message.includes('dialog unavailable')), `error messages: ${JSON.stringify(harness.errors)}`);
+    harness.extension.deactivate();
+});
+
+run('extension Command Palette Save does not overlap live reading', async () => {
+    const sourcePath = '/tmp/kokoreader-reading.md';
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'unsaved text' },
+    });
+    harness.commands.get('kokoreader.readFile')();
+    await harness.commands.get('kokoreader.saveFile')();
+    harness.extension.deactivate();
+    assert(harness.spawned.length === 1, `Save overlapped reading with ${harness.spawned.length} processes`);
+});
+
+run('table conversion preserves single newlines outside a table', () => {
+    const paths = stubs({ text: 'Before line.\nStill before.\n\n| Name | Value |\n| --- | --- |\n| alpha | one |\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'Before line.\nStill before.', 'Table. Columns: Name, Value.', 'Row 1. Name: alpha. Value: one.',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('malformed tables retain their source text', () => {
+    const paths = stubs({ text: '| Name | Value |\n| --- | --- |\n| alpha | one | extra |\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        '| Name | Value |\n| --- | --- |\n| alpha | one | extra |',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('technical code blocks do not parse table-like code', () => {
+    const paths = stubs({ text: '```text\n| Name | Value |\n| --- | --- |\n| alpha | one |\n```\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--profile', 'technical', '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'The code is .. | Name | Value |\n| dash dash dash | dash dash dash |\n| alpha | one |',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('technical mode reads and normalizes closed fenced code', () => {
+    const paths = stubs({ text: 'Before.\n\n```js\nconst nmnm.jsonc = camelCase_path;\n```\n\nAfter.\n' });
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--profile', 'technical', '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status === 0, `technical profile failed: ${result.stderr}`);
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'Before.', 'The code is .. const nmnm dot jsonc = camel Case underscore path;', 'After.',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('config file selects the technical profile', () => {
+    const paths = stubs({ text: '```text\nnmnm.jsonc\n```\n' });
+    const conf = path.join(paths.dir, 'config');
+    fs.writeFileSync(conf, 'PROFILE=technical\n');
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KOKORO_READER_CONFIG: conf },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status === 0, `technical config profile failed: ${result.stderr}`);
+    assert(JSON.stringify(prepared) === JSON.stringify(['The code is .. nmnm dot jsonc']), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('profile accepts only built-in names and extension forwards it', () => {
+    const invalid = cli(['--profile', 'custom']);
+    const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    assert(invalid.status !== 0 && invalid.stderr.includes('profile must be narrative or technical'), `invalid profile: ${invalid.stderr}`);
+    assert(source.includes("add('--profile', 'profile')"), 'extension does not forward profile');
+    const setting = manifest.contributes.configuration.properties['kokoreader.profile'];
+    assert(setting && JSON.stringify(setting.enum) === JSON.stringify(['narrative', 'technical']), 'extension profile setting is missing or invalid');
+    assert(setting.default === 'technical', 'technical is not the extension default profile');
 });
 
 run('spaced dashes become a pause Kokoro can render, compounds stay joined', () => {
@@ -714,5 +1063,7 @@ run('a signal during synthesis reaps the resident worker', () => {
     }
 });
 
-console.log(`\n${passed}/${passed + failed} passed`);
-process.exit(failed ? 1 : 0);
+Promise.all(pending).then(() => {
+    console.log(`\n${passed}/${passed + failed} passed`);
+    process.exit(failed ? 1 : 0);
+});
