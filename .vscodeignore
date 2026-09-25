@@ -5,6 +5,7 @@ config/kokoreader.conf
 .github
 *.vsix
 .DS_Store
+AGENTS.md
 
 ## build caches
 __pycache__/
