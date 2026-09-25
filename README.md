@@ -29,11 +29,17 @@ It preserves a natural **800 ms** gap between source paragraphs in both live pla
 
 ### Markdown-aware, without silently hiding structure
 
-Formatting, links, images, and HTML are removed before speech. Closed triple-backtick code blocks are skipped but announced:
+Formatting, links, images, and HTML are removed before speech. Block quotes are announced as “Quote.”, including quoted task and list items; task-list items are “Checked item.” or “Unchecked item.”, and regular list items retain an item marker. The default technical profile says “The code is - ” and reads closed triple-backtick code blocks. Use `-p narrative` or set `PROFILE=narrative` to announce them instead:
 
 > "A code block follows. You can see the code in the document."
 
-That keeps a listener oriented without reading source code character by character.
+### Reading profiles
+
+**Technical** is the default: it reads closed code blocks after saying “The code is - ”, and normalizes inline code, decimal numbers, and currency amounts for speech. **Narrative** is available with `-p narrative`, `PROFILE=narrative`, or `kokoreader.profile`; it removes Markdown formatting and announces closed code blocks without reading their source. Both profiles read well-formed Markdown tables, including one-column tables, as labeled rows.
+
+### Language-aware Markdown labels
+
+The speech-inserted Markdown labels follow `--lang` / `kokoreader.lang`: code-block introductions, table/column/row/blank-cell markers, quotes, task state, and list items are mapped for `en-us`, `en-gb`, `es`, `fr-fr`, `hi`, `it`, `ja`, `pt-br`, and `cmn`. Any other language code uses English labels. Technical-token normalization, including “dot”, “dash”, and currency names, remains English in this release.
 
 ### Playback controls that respect listening
 
@@ -167,6 +173,7 @@ MODEL_PRECISION=fp32
 PYTHON_PATH=/path/to/python3
 VOICE=af_heart
 LANG=en-us
+PROFILE=technical
 SPEED=1.0
 TEMPO=1.0
 GAIN=-1
@@ -213,6 +220,7 @@ printf 'Hello from Kokoreader.\n' | node bin/kokoreader.js
 | `-mp`, `--model-precision P` | Download/use `fp32` (default), `fp16`, or `int8` model assets. |
 | `-py`, `--python-path PATH` | Python interpreter executable. |
 | `-v`, `--voice NAME`; `-l`, `--lang CODE`; `-s`, `--speed N` | Voice, language, and Kokoro synthesis speed (0.5-2.0). |
+| `-p`, `--profile NAME` | `technical` (default) says “The code is - ” then reads closed fenced code blocks; `narrative` announces them. |
 | `-t`, `--tempo N`; `-g`, `--gain DB`; `-vol`, `--volume N` | Final playback controls. Tempo accepts 0.5 through 100. |
 | `-f`, `--format TYPE`; `-sr`, `--sample-rate HZ` | Saved format and sample rate. The format controls encoding; use a matching filename extension. |
 | `-n`, `--normalize`; `-nn`, `--no-normalize` | Enable or disable EBU R128 normalization. |
@@ -221,15 +229,15 @@ printf 'Hello from Kokoreader.\n' | node bin/kokoreader.js
 | `-sp`, `--start-para N` | Start at one-based paragraph N; `0` reads from the beginning. |
 | `-d`, `--download` | Download selected assets to `--model-dir`. |
 | `--force` | With `--download`, replace assets whose SHA-256 does not match the release. |
-| `-ls`, `--list`; `-ll`, `--list-languages`; `-dbg`, `--debug` | List voices, list accepted language codes, or show worker errors. |
+| `-ls`, `--list`; `-ll`, `--list-languages`; `-dbg`, `--debug` | List voices, list accepted language codes, or show worker errors. Add `--lang CODE` to `--list` to show only installed voices matching that Kokoro voice language. |
 
-Input is plain text or Markdown. Formatting, links, images, and HTML tags are removed before synthesis. A closed triple-backtick fenced code block is skipped and replaced with the spoken paragraph:
+Input is plain text or Markdown. Formatting, links, images, and HTML tags are removed before synthesis. The default `technical` profile says “The code is - ” before reading a closed triple-backtick fenced code block. With `-p narrative`, the block is replaced with the spoken paragraph:
 
 ```text
 “A code block follows. You can see the code in the document.”
 ```
 
-Inline code remains readable; tilde fences and unclosed fences retain their literal text.
+Inline backtick code is normalized as a technical token in both profiles: dots become “dot”, underscores become “underscore”, path separators become “slash” or “backslash”, hyphens become “dash”, and camelCase gets a word boundary. Thus `nmnm.jsonc` is read as “nmnm dot jsonc.” In either profile, a dot directly between digits is read as “dot”, so `3.11` becomes “3 dot 11.” Currency decimals instead use “point” and a trailing currency name: `$3.50`, `€45.35`, `£1.00`, and `¥0.75` become “3 point 50 dollars,” “45 point 35 euros,” “1 point 00 pounds,” and “0 point 75 yen.” Block quotes are announced, task-list state is spoken, and unordered or ordered lists retain item markers. These inserted labels use the configured language map for `en-us`, `en-gb`, `es`, `fr-fr`, `hi`, `it`, `ja`, `pt-br`, and `cmn`; unsupported codes use English labels. Well-formed GitHub-flavored pipe tables, including one-column tables, are read in both profiles as a table and column announcement followed by one labeled row per paragraph; blank cells use the configured language’s blank marker. Malformed tables remain source text. The `technical` profile uses the configured language’s code introduction before reading each closed triple-backtick fence with those rules. Tilde fences and unclosed fences retain their literal text.
 
 ## VS Code and VSCodium setup
 
@@ -240,9 +248,11 @@ Configure these editor settings:
 1. `kokoreader.pythonPath`: an absolute Python 3.11+ executable with the requirements installed.
 2. `kokoreader.modelDir`: the downloaded model directory, or both `kokoreader.modelPath` and `kokoreader.voicesPath`.
 3. `kokoreader.modelPrecision`: `fp32` by default, or `fp16`/`int8` when the matching model asset was downloaded.
-4. Optionally set voice and playback controls below, and `kokoreader.debug` to reveal Python worker errors.
+4. `kokoreader.profile` defaults to `technical`; set it to `narrative` to announce, rather than read, fenced code. The setting applies to Read, Read From Cursor, and Save to File.
+5. `kokoreader.lang` is a dropdown of Kokoro-82M’s nine voice languages. Set `kokoreader.voice` manually to a matching installed voice; use `kokoreader --list --lang CODE` to inspect matches. The interactive language and filtered voice commands are deferred.
+6. Optionally set playback controls below, and `kokoreader.debug` to reveal Python worker errors.
 
-Right-click an editor tab for **Read**, **Read From Cursor**, **Pause**, **Resume**, **Stop**, or **Save to File**. **Read** speaks the selection when one exists, otherwise the file. **Read From Cursor** ignores any selection and speaks from the exact active cursor position through the end of the current in-memory document, so it can start mid-word. **Save to File** uses `kokoreader.format` to select WAV, MP3, FLAC, or Opus. The status bar shows activity and stops active playback when clicked. **Pause** mutes at once and **Resume** replays the current paragraph from where it stopped, so a word or two can repeat.
+Right-click an editor tab for **Read**, **Read From Cursor**, **Pause**, **Resume**, **Stop**, or **Save to File**. On the active editor, **Read** and **Save to File** use its current in-memory selection when one exists, otherwise its current in-memory document, so unsaved edits are included. A command invoked for another tab reads that tab’s saved file rather than silently using the active editor. **Read From Cursor** ignores any selection and speaks from the exact active cursor position through the end of the current in-memory document, so it can start mid-word. **Save to File** uses `kokoreader.format` to select WAV, MP3, FLAC, or Opus; it is unavailable while reading, and only one export or pending save dialog can run at a time. **Stop** cancels either safely before an export process or private temporary input is created. The same guards apply to Command Palette commands, and a dialog failure restores the commands immediately. The status bar shows activity and stops active playback when clicked. **Pause** mutes at once and **Resume** replays the current paragraph from where it stopped, so a word or two can repeat.
 
 ## Voice quality and performance controls
 
@@ -251,7 +261,8 @@ Right-click an editor tab for **Read**, **Read From Cursor**, **Pause**, **Resum
 | Setting | Effect | Viability |
 | --- | --- | --- |
 | `voice` / `VOICE` / `--voice` | Selects Kokoro timbre and style. | Implemented. |
-| `lang` / `LANG` / `--lang` | Selects language/phonemization behavior. Must be an **espeak-ng** code, which is what `kokoro-onnx` passes to its backend; run `--list-languages` for the accepted set. Match it to the language of the text, not only to the voice. | Implemented. |
+| `lang` / `LANG` / `--lang` | Selects language/phonemization behavior. In VS Code, the dropdown contains Kokoro-82M’s supported voice languages: `en-us`, `en-gb`, `es`, `fr-fr`, `hi`, `it`, `ja`, `pt-br`, and `cmn`. The CLI remains flexible for any installed **espeak-ng** code; use `--list --lang CODE` to list matching installed voices. | Implemented. |
+| `profile` / `PROFILE` / `-p`, `--profile` | Selects `technical` (default; say “The code is - ” then read closed fenced code) or `narrative` (announce it). Inline backtick code is normalized technically in both profiles. | Implemented. |
 | `speed` / `SPEED` / `--speed` | Changes Kokoro synthesis speed. Kokoreader enforces the 0.5-2.0 range that `kokoro-onnx` accepts; use `tempo` for larger changes. | Implemented. |
 | `tempo` / `TEMPO` / `--tempo` | Changes final speed while preserving pitch. | Implemented; use moderate values for best quality. |
 | `gain` / `GAIN` / `--gain` | Sets output headroom in dB. Negative gain reduces clipping risk. | Implemented. |
@@ -290,6 +301,65 @@ Piper noise scales, speaker IDs, and phoneme-length scale have no Kokoro equival
 | `jf_*`, `jm_*` | Japanese | `ja` |
 | `pf_*`, `pm_*` | Brazilian Portuguese | `pt-br` |
 | `zf_*`, `zm_*` | Mandarin Chinese | `cmn` |
+
+The following Kokoro-82M v1.0 inventory and overall grades are derived from upstream [`VOICES.md`](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md). Grades estimate training-data quality and quantity, not a universal listening-quality ranking. “Not published” means upstream does not provide an overall grade for that voice. Custom or partial local `voices-v1.0.bin` assets can differ; use `--list` to inspect what is installed.
+
+| Name | Grade | Language |
+| --- | --- | --- |
+| `af_heart` | A | American English |
+| `af_alloy` | C | American English |
+| `af_aoede` | C+ | American English |
+| `af_bella` | A- | American English |
+| `af_jessica` | D | American English |
+| `af_kore` | C+ | American English |
+| `af_nicole` | B- | American English |
+| `af_nova` | C | American English |
+| `af_river` | D | American English |
+| `af_sarah` | C+ | American English |
+| `af_sky` | C- | American English |
+| `am_adam` | F+ | American English |
+| `am_echo` | D | American English |
+| `am_eric` | D | American English |
+| `am_fenrir` | C+ | American English |
+| `am_liam` | D | American English |
+| `am_michael` | C+ | American English |
+| `am_onyx` | D | American English |
+| `am_puck` | C+ | American English |
+| `am_santa` | D- | American English |
+| `bf_alice` | D | British English |
+| `bf_emma` | B- | British English |
+| `bf_isabella` | C | British English |
+| `bf_lily` | D | British English |
+| `bm_daniel` | D | British English |
+| `bm_fable` | C | British English |
+| `bm_george` | C | British English |
+| `bm_lewis` | D+ | British English |
+| `ef_dora` | Not published | Spanish |
+| `em_alex` | Not published | Spanish |
+| `em_santa` | Not published | Spanish |
+| `ff_siwis` | B- | French |
+| `hf_alpha` | C | Hindi |
+| `hf_beta` | C | Hindi |
+| `hm_omega` | C | Hindi |
+| `hm_psi` | C | Hindi |
+| `if_sara` | C | Italian |
+| `im_nicola` | C | Italian |
+| `jf_alpha` | C+ | Japanese |
+| `jf_gongitsune` | C | Japanese |
+| `jf_nezumi` | C- | Japanese |
+| `jf_tebukuro` | C | Japanese |
+| `jm_kumo` | C- | Japanese |
+| `pf_dora` | Not published | Brazilian Portuguese |
+| `pm_alex` | Not published | Brazilian Portuguese |
+| `pm_santa` | Not published | Brazilian Portuguese |
+| `zf_xiaobei` | D | Mandarin Chinese |
+| `zf_xiaoni` | D | Mandarin Chinese |
+| `zf_xiaoxiao` | D | Mandarin Chinese |
+| `zf_xiaoyi` | D | Mandarin Chinese |
+| `zm_yunjian` | D | Mandarin Chinese |
+| `zm_yunxi` | D | Mandarin Chinese |
+| `zm_yunxia` | D | Mandarin Chinese |
+| `zm_yunyang` | D | Mandarin Chinese |
 
 List every code the installed espeak-ng build accepts, plus the voice counts for the assets in `--model-dir`:
 
