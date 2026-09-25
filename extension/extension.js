@@ -36,6 +36,7 @@ function configArgs(config) {
     const addBool = (enabled, disabled, name) => args.push(config.get(name) ? enabled : disabled);
     add('--model-dir', 'modelDir'); add('--model', 'modelPath'); add('--voices', 'voicesPath'); add('--model-precision', 'modelPrecision');
     add('--python-path', 'pythonPath'); add('--voice', 'voice'); add('--lang', 'lang');
+    add('--profile', 'profile');
     add('--speed', 'speed'); add('--tempo', 'tempo'); add('--gain', 'gain'); add('--volume', 'volume');
     add('--format', 'format'); add('--sample-rate', 'sampleRate');
     addBool('--normalize', '--no-normalize', 'normalize'); addBool('--limiter', '--no-limiter', 'limiter');

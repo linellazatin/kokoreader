@@ -33,7 +33,7 @@ const ASSET_SHA256 = {
 const DEFAULTS = {
     MODEL_DIR: '', MODEL_PATH: '', VOICES_PATH: '', PYTHON_PATH: '',
     MODEL_PRECISION: 'fp32',
-    VOICE: 'af_heart', LANG: 'en-us', SPEED: 1, TEMPO: 1, GAIN: -1,
+    VOICE: 'af_heart', LANG: 'en-us', PROFILE: 'technical', SPEED: 1, TEMPO: 1, GAIN: -1,
     VOLUME: 1, FORMAT: 'wav', SAMPLE_RATE: 0, NORMALIZE: false, LIMITER: true,
     OUTPUT_FILE: '', START_PARA: 0, DEBUG: false, FORCE: false,
 };
@@ -75,6 +75,7 @@ function usage() {
 `  -py, --python-path PATH    Python 3.11 or newer interpreter\n` +
 `  -v, --voice NAME           Kokoro voice (default: af_heart)\n` +
 `  -l, --lang CODE            Language code (default: en-us)\n` +
+`  -p, --profile NAME         narrative or technical (default: technical)\n` +
 `  -s, --speed N              Kokoro synthesis speed 0.5-2.0 (default: 1)\n\n` +
 `Playback:\n` +
 `  -t, --tempo N              Pitch-preserving playback speed (default: 1)\n` +
@@ -115,6 +116,7 @@ function parseArgs(argv, cfg) {
             case '-py': case '--python-path': cfg.PYTHON_PATH = value(); break;
             case '-v': case '--voice': cfg.VOICE = value(); break;
             case '-l': case '--lang': cfg.LANG = value(); break;
+            case '-p': case '--profile': cfg.PROFILE = value().toLowerCase(); break;
             case '-s': case '--speed': cfg.SPEED = Number(value()); break;
             case '-t': case '--tempo': cfg.TEMPO = Number(value()); break;
             case '-g': case '--gain': cfg.GAIN = Number(value()); break;
@@ -142,6 +144,7 @@ function parseArgs(argv, cfg) {
         if (!Number.isFinite(cfg[key])) throw new Error(`Invalid numeric value for ${key.toLowerCase()}`);
     }
     if (!Number.isFinite(cfg.SPEED) || cfg.SPEED < 0.5 || cfg.SPEED > 2) throw new Error('speed must be between 0.5 and 2.0');
+    if (!['narrative', 'technical'].includes(cfg.PROFILE)) throw new Error('profile must be narrative or technical');
     if (!Number.isFinite(cfg.TEMPO) || cfg.TEMPO < 0.5 || cfg.TEMPO > 100) throw new Error('tempo must be between 0.5 and 100');
     if (!Number.isInteger(cfg.START_PARA) || cfg.START_PARA < 0) throw new Error('start-para must be a non-negative integer');
     if (!Number.isInteger(cfg.SAMPLE_RATE) || cfg.SAMPLE_RATE < 0) throw new Error('sample-rate must be a non-negative integer');
@@ -166,13 +169,87 @@ function requireAssets(cfg) {
     return result;
 }
 
-function stripMarkdown(text) {
-    return text.replace(/^```[\s\S]*?^```\s*$/gm, '\n\nA code block follows. You can see the code in the document.\n\n')
+function normalizeTechnicalTokens(text) {
+    return normalizeCurrencies(text).replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/_/g, ' underscore ').replace(/\\/g, ' backslash ')
+        .replace(/\//g, ' slash ').replace(/-/g, ' dash ').replace(/\./g, ' dot ')
+        .replace(/[ \t]+/g, ' ').trim();
+}
+
+function normalizeCurrencies(text) {
+    const names = { '$': 'dollars', '€': 'euros', '£': 'pounds', '¥': 'yen' };
+    return text.replace(/([$€£¥])(\d+)\.(\d+)/g, (_, symbol, whole, fraction) =>
+        `${whole} point ${fraction} ${names[symbol]}`);
+}
+
+function normalizeDecimalPoints(text) {
+    return text.replace(/(?<=\d)\.(?=\d)/g, ' dot ');
+}
+
+function tableCells(line) {
+    return line.trim().replace(/^\|/, '').replace(/\|$/, '')
+        .split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, '|'));
+}
+
+function isTableSeparator(line) {
+    const cells = tableCells(line);
+    return cells.length > 1 && cells.every(cell => /^:?-{3,}:?$/.test(cell));
+}
+
+function normalizeMarkdownTables(text) {
+    const lines = text.split('\n');
+    const output = [];
+    for (let index = 0; index < lines.length; index++) {
+        const headers = tableCells(lines[index]);
+        if (!lines[index].includes('|') || !lines[index + 1] || !isTableSeparator(lines[index + 1]) ||
+            headers.length !== tableCells(lines[index + 1]).length) {
+            output.push(lines[index]);
+            continue;
+        }
+        const rows = [];
+        let end = index + 2;
+        while (end < lines.length && lines[end].includes('|') && lines[end].trim()) {
+            const cells = tableCells(lines[end]);
+            if (cells.length !== headers.length) break;
+            rows.push(cells);
+            end++;
+        }
+        if (end < lines.length && lines[end].includes('|') && lines[end].trim()) {
+            output.push(lines[index]);
+            continue;
+        }
+        const labels = headers.map((header, column) => header || `Column ${column + 1}`);
+        const spokenRows = [`Table. Columns: ${labels.join(', ')}.`];
+        rows.forEach((cells, row) => spokenRows.push(`Row ${row + 1}. ${cells.map((cell, column) =>
+            `${labels[column]}: ${cell || 'blank'}.`).join(' ')}`));
+        output.push(spokenRows.join('\n\n'));
+        index = end - 1;
+    }
+    return output.join('\n');
+}
+
+function stripMarkdown(text, cfg) {
+    const inline = [];
+    const protectedInline = text.replace(/`([^`\n]+)`/g, (_, code) => {
+        const token = `\uE000${inline.length}\uE001`;
+        inline.push(normalizeTechnicalTokens(code));
+        return token;
+    });
+    const blocks = [];
+    const protectedBlocks = protectedInline.replace(/^```[^\n]*\n([\s\S]*?)^```\s*$/gm, (_, code) => {
+        const token = `\uE100${blocks.length}\uE101`;
+        blocks.push(cfg.PROFILE === 'technical' ? `\n\nThe code is - ${normalizeTechnicalTokens(code)}\n\n` :
+            '\n\nA code block follows. You can see the code in the document.\n\n');
+        return token;
+    });
+    return normalizeDecimalPoints(normalizeCurrencies(normalizeMarkdownTables(protectedBlocks)
         .replace(/`([^`]*)`/g, '$1').replace(/^[ \t]*#+[ \t]*/gm, '')
         .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
         .replace(/<\/?[a-zA-Z!][^>]*>/g, '').replace(/\*\*([^*]*)\*\*/g, '$1')
         .replace(/__([^_]*)__/g, '$1').replace(/\*([^*]*)\*/g, '$1')
-        .replace(/^[ \t]*[-*=]{3,}[ \t]*$/gm, '').replace(/\n{3,}/g, '\n\n');
+        .replace(/^[ \t]*[-*=]{3,}[ \t]*$/gm, '').replace(/\n{3,}/g, '\n\n')
+        .replace(/\uE000(\d+)\uE001/g, (_, index) => inline[Number(index)])
+        .replace(/\uE100(\d+)\uE101/g, (_, index) => blocks[Number(index)])));
 }
 
 // Kokoro never learned a pause for dashes: espeak-ng drops spaced hyphens
@@ -181,9 +258,10 @@ function stripMarkdown(text) {
 // ".."  which it renders as a real ~170 ms pause. Word-internal hyphens
 // (local-first) stay joined. The lookbehind keeps dash-prefixed lines
 // (list bullets) untouched.
-function paragraphs(text) {
-    return stripMarkdown(text).split(/\n\n+/)
-        .map(x => x.trim().replace(/(?<=\S)[ \t]+[-–—]{1,}[ \t]+(?=\S)/g, ' .. '))
+function paragraphs(text, cfg) {
+    return stripMarkdown(text, cfg).split(/\n\n+/)
+        .map(x => x.trim().split('\n').map(line => isTableSeparator(line) ? line :
+            line.replace(/(?<=\S)[ \t]+[-–—]{1,}[ \t]+(?=\S)/g, ' .. ')).join('\n'))
         .filter(Boolean);
 }
 
@@ -439,7 +517,7 @@ async function playPreparedUnits(units, worker, cfg) {
 async function read(inputFile, cfg) {
     const raw = inputFile ? fs.readFileSync(inputFile, 'utf8') : await readStdin();
     if (inputFile) setupIPC();
-    const text = paragraphs(raw);
+    const text = paragraphs(raw, cfg);
     if (!text.length) throw new Error('Nothing to read.');
     if (cfg.START_PARA > text.length) throw new Error(`start-para must be no greater than the number of paragraphs (${text.length})`);
     const worker = activeWorker = new Worker(cfg);

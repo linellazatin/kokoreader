@@ -143,7 +143,7 @@ run('--help exposes output processing controls', () => {
 run('--help exposes compact aliases and model precision', () => {
     const result = cli(['--help']);
     assert(result.status === 0, `exit ${result.status}: ${result.stderr}`);
-    for (const option of ['-md', '-mp', '--model-precision', '-sr', '-lim']) {
+    for (const option of ['-md', '-mp', '--model-precision', '-sr', '-lim', '-p', '--profile']) {
         assert(result.stdout.includes(option), `missing ${option}`);
     }
 });
@@ -264,7 +264,7 @@ run('extension settings have an intentional setup-to-output order', () => {
     const settings = manifest.contributes.configuration.properties;
     const ordered = [
         'kokoreader.pythonPath', 'kokoreader.modelDir', 'kokoreader.modelPath', 'kokoreader.voicesPath', 'kokoreader.modelPrecision',
-        'kokoreader.voice', 'kokoreader.lang', 'kokoreader.speed',
+        'kokoreader.voice', 'kokoreader.lang', 'kokoreader.profile', 'kokoreader.speed',
         'kokoreader.tempo', 'kokoreader.gain', 'kokoreader.volume',
         'kokoreader.format', 'kokoreader.sampleRate', 'kokoreader.normalize', 'kokoreader.limiter'
     ];
@@ -410,7 +410,7 @@ run('extension reports a failed reader exit and can surface worker errors', () =
     assert(source.includes('Kokoreader: reader failed'), 'failed reader exit is not shown to the user');
     assert(source.includes("lastLine.indexOf('Error: ')"), 'error detail is parsed only from the start of a line the progress text shares');
     assert(source.includes("'--debug'"), 'worker debug output cannot be forwarded');
-    assert(manifest.contributes.configuration.properties['kokoreader.debug'].order === 16, 'debug setting is not ordered last');
+    assert(manifest.contributes.configuration.properties['kokoreader.debug'].order === 17, 'debug setting is not ordered last');
 });
 
 run('relative model paths from a config file resolve against the install directory', () => {
@@ -504,7 +504,7 @@ run('text comparisons are not mistaken for HTML tags', () => {
     assert(synthesized[0].phonemes === 'if x < 10 and y > 5 then stop.', 'prepared unit was not synthesized');
 });
 
-run('closed fenced code is replaced by a spoken marker', () => {
+run('technical is the default profile for closed fenced code', () => {
     const paths = stubs({ text: 'Before.\n\n```js\nconst hidden = true;\n```\n\nAfter.\n' });
     spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
         env: { ...process.env, ...stubEnv(paths) },
@@ -512,8 +512,137 @@ run('closed fenced code is replaced by a spoken marker', () => {
     const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
     fs.rmSync(paths.dir, { recursive: true, force: true });
     assert(JSON.stringify(prepared) === JSON.stringify([
-        'Before.', 'A code block follows. You can see the code in the document.', 'After.',
+        'Before.', 'The code is .. const hidden = true;', 'After.',
     ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('narrative mode normalizes inline code as technical tokens', () => {
+    const paths = stubs({ text: 'Use `nmnm.jsonc` and `camelCase_path/file-name`.\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '-p', 'narrative', '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'Use nmnm dot jsonc and camel Case underscore path slash file dash name.',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('both profiles pronounce compact decimal numbers with dot', () => {
+    for (const profile of ['narrative', 'technical']) {
+        const paths = stubs({ text: 'Python 3.11 costs $3.50.\n' });
+        spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--profile', profile, '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+            env: { ...process.env, ...stubEnv(paths) },
+        });
+        const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+        assert(JSON.stringify(prepared) === JSON.stringify(['Python 3 dot 11 costs 3 point 50 dollars.']),
+            `${profile} prepared text: ${JSON.stringify(prepared)}`);
+    }
+});
+
+run('both profiles normalize currency decimals with a trailing currency name', () => {
+    for (const profile of ['narrative', 'technical']) {
+        const paths = stubs({ text: '$3.50 €45.35 £1.00 ¥0.75 and version 3.11.\n' });
+        spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--profile', profile, '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+            env: { ...process.env, ...stubEnv(paths) },
+        });
+        const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+        assert(JSON.stringify(prepared) === JSON.stringify([
+            '3 point 50 dollars 45 point 35 euros 1 point 00 pounds 0 point 75 yen and version 3 dot 11.',
+        ]), `${profile} prepared text: ${JSON.stringify(prepared)}`);
+    }
+});
+
+run('both profiles read GFM tables as labeled rows', () => {
+    for (const profile of ['narrative', 'technical']) {
+        const paths = stubs({ text: '| Name | Value |\n| :--- | ---: |\n| alpha | 3.11 |\n| beta | |\n\nAfter.\n' });
+        spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--profile', profile, '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+            env: { ...process.env, ...stubEnv(paths) },
+        });
+        const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+        assert(JSON.stringify(prepared) === JSON.stringify([
+            'Table. Columns: Name, Value.',
+            'Row 1. Name: alpha. Value: 3 dot 11.',
+            'Row 2. Name: beta. Value: blank.',
+            'After.',
+        ]), `${profile} prepared text: ${JSON.stringify(prepared)}`);
+    }
+});
+
+run('table conversion preserves single newlines outside a table', () => {
+    const paths = stubs({ text: 'Before line.\nStill before.\n\n| Name | Value |\n| --- | --- |\n| alpha | one |\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'Before line.\nStill before.', 'Table. Columns: Name, Value.', 'Row 1. Name: alpha. Value: one.',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('malformed tables retain their source text', () => {
+    const paths = stubs({ text: '| Name | Value |\n| --- | --- |\n| alpha | one | extra |\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        '| Name | Value |\n| --- | --- |\n| alpha | one | extra |',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('technical code blocks do not parse table-like code', () => {
+    const paths = stubs({ text: '```text\n| Name | Value |\n| --- | --- |\n| alpha | one |\n```\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--profile', 'technical', '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'The code is .. | Name | Value |\n| dash dash dash | dash dash dash |\n| alpha | one |',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('technical mode reads and normalizes closed fenced code', () => {
+    const paths = stubs({ text: 'Before.\n\n```js\nconst nmnm.jsonc = camelCase_path;\n```\n\nAfter.\n' });
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--profile', 'technical', '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status === 0, `technical profile failed: ${result.stderr}`);
+    assert(JSON.stringify(prepared) === JSON.stringify([
+        'Before.', 'The code is .. const nmnm dot jsonc = camel Case underscore path;', 'After.',
+    ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('config file selects the technical profile', () => {
+    const paths = stubs({ text: '```text\nnmnm.jsonc\n```\n' });
+    const conf = path.join(paths.dir, 'config');
+    fs.writeFileSync(conf, 'PROFILE=technical\n');
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KOKORO_READER_CONFIG: conf },
+    });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status === 0, `technical config profile failed: ${result.stderr}`);
+    assert(JSON.stringify(prepared) === JSON.stringify(['The code is .. nmnm dot jsonc']), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('profile accepts only built-in names and extension forwards it', () => {
+    const invalid = cli(['--profile', 'custom']);
+    const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    assert(invalid.status !== 0 && invalid.stderr.includes('profile must be narrative or technical'), `invalid profile: ${invalid.stderr}`);
+    assert(source.includes("add('--profile', 'profile')"), 'extension does not forward profile');
+    const setting = manifest.contributes.configuration.properties['kokoreader.profile'];
+    assert(setting && JSON.stringify(setting.enum) === JSON.stringify(['narrative', 'technical']), 'extension profile setting is missing or invalid');
+    assert(setting.default === 'technical', 'technical is not the extension default profile');
 });
 
 run('spaced dashes become a pause Kokoro can render, compounds stay joined', () => {
