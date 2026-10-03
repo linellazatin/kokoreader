@@ -58,6 +58,7 @@ function configArgs(config) {
     add('--python-path', 'pythonPath'); add('--voice', 'voice'); add('--lang', 'lang');
     add('--profile', 'profile');
     add('--speed', 'speed'); add('--tempo', 'tempo'); add('--gain', 'gain'); add('--volume', 'volume');
+    add('--threads', 'threads'); add('--pronunciations', 'pronunciationsPath');
     add('--format', 'format'); add('--sample-rate', 'sampleRate');
     addBool('--normalize', '--no-normalize', 'normalize'); addBool('--limiter', '--no-limiter', 'limiter');
     if (config.get('debug')) args.push('--debug');
@@ -186,6 +187,14 @@ function activate(context) {
         if (!activeProc || !paused) return;
         paused = false; activeProc.stdin.write('resume\n'); setState(true, false); updateStatus('playing...');
     });
+    const navigate = action => () => {
+        if (!activeProc) return;
+        activeProc.stdin.write(`${action}\n`);
+        updateStatus(paused ? 'paused...' : 'playing...');
+    };
+    const previousCommand = vscode.commands.registerCommand('kokoreader.previousParagraph', navigate('previous'));
+    const replayCommand = vscode.commands.registerCommand('kokoreader.replayParagraph', navigate('replay'));
+    const nextCommand = vscode.commands.registerCommand('kokoreader.nextParagraph', navigate('next'));
     const stopCommand = vscode.commands.registerCommand('kokoreader.stop', stop);
     const saveCommand = vscode.commands.registerCommand('kokoreader.saveFile', async uri => {
         const config = vscode.workspace.getConfiguration('kokoreader');
@@ -243,7 +252,7 @@ function activate(context) {
         process.on('error', error => { item.dispose(); clearSave(); vscode.window.showErrorMessage(`Kokoreader: ${error.message}`); });
         process.on('exit', code => { item.dispose(); clearSave(); vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (exit ${code})`); });
     });
-    context.subscriptions.push(readCommand, cursorCommand, pauseCommand, resumeCommand, stopCommand, saveCommand);
+    context.subscriptions.push(readCommand, cursorCommand, pauseCommand, resumeCommand, previousCommand, replayCommand, nextCommand, stopCommand, saveCommand);
 }
 
 function deactivate() { stop(); }

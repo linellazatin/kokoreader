@@ -35,15 +35,16 @@ const DEFAULTS = {
     MODEL_PRECISION: 'fp32',
     VOICE: 'af_heart', LANG: 'en-us', PROFILE: 'technical', SPEED: 1, TEMPO: 1, GAIN: -1,
     VOLUME: 1, FORMAT: 'wav', SAMPLE_RATE: 0, NORMALIZE: false, LIMITER: true,
-    OUTPUT_FILE: '', START_PARA: 0, DEBUG: false, FORCE: false,
+    THREADS: 0, PRONUNCIATIONS_PATH: '', OUTPUT_FILE: '', START_PARA: 0, DEBUG: false, FORCE: false,
 };
 const VOICE_LANGS = Object.freeze({
     a: 'en-us', b: 'en-gb', e: 'es', f: 'fr-fr', h: 'hi',
     i: 'it', j: 'ja', p: 'pt-br', z: 'cmn',
 });
+const WORKER_TIMEOUT_MS = 120000;
 
 const INSTALL_DIR = path.join(__dirname, '..');
-const PATH_CONFIG_KEYS = new Set(['MODEL_DIR', 'MODEL_PATH', 'VOICES_PATH']);
+const PATH_CONFIG_KEYS = new Set(['MODEL_DIR', 'MODEL_PATH', 'VOICES_PATH', 'PRONUNCIATIONS_PATH']);
 // Model and playback settings only: a config file must not quietly change what a
 // single run does, or every editor read would overwrite the same output file.
 const IGNORED_CONFIG_KEYS = new Set(['OUTPUT_FILE', 'START_PARA', 'DEBUG', 'FORCE']);
@@ -81,6 +82,8 @@ function usage() {
 `  -l, --lang CODE            Language code (default: en-us)\n` +
 `  -p, --profile NAME         narrative or technical (default: technical)\n` +
 `  -s, --speed N              Kokoro synthesis speed 0.5-2.0 (default: 1)\n\n` +
+`  --threads N                ONNX Runtime thread cap; 0 selects automatically\n` +
+`  --pronunciations FILE      Local JSON source-phrase replacements\n\n` +
 `Playback:\n` +
 `  -t, --tempo N              Pitch-preserving playback speed (default: 1)\n` +
 `  -g, --gain DB              ffmpeg gain in dB (default: -1)\n` +
@@ -122,6 +125,8 @@ function parseArgs(argv, cfg) {
             case '-l': case '--lang': cfg.LANG = value(); explicitLanguage = true; break;
             case '-p': case '--profile': cfg.PROFILE = value().toLowerCase(); break;
             case '-s': case '--speed': cfg.SPEED = Number(value()); break;
+            case '--threads': cfg.THREADS = Number(value()); break;
+            case '--pronunciations': cfg.PRONUNCIATIONS_PATH = value(); break;
             case '-t': case '--tempo': cfg.TEMPO = Number(value()); break;
             case '-g': case '--gain': cfg.GAIN = Number(value()); break;
             case '-vol': case '--volume': cfg.VOLUME = Number(value()); break;
@@ -152,6 +157,7 @@ function parseArgs(argv, cfg) {
     if (!Number.isFinite(cfg.TEMPO) || cfg.TEMPO < 0.5 || cfg.TEMPO > 100) throw new Error('tempo must be between 0.5 and 100');
     if (!Number.isInteger(cfg.START_PARA) || cfg.START_PARA < 0) throw new Error('start-para must be a non-negative integer');
     if (!Number.isInteger(cfg.SAMPLE_RATE) || cfg.SAMPLE_RATE < 0) throw new Error('sample-rate must be a non-negative integer');
+    if (!Number.isInteger(cfg.THREADS) || cfg.THREADS < 0) throw new Error('threads must be a non-negative integer');
     if (!['wav', 'mp3', 'flac', 'opus'].includes(cfg.FORMAT)) throw new Error('format must be wav, mp3, flac, or opus');
     if (!Object.hasOwn(MODEL_FILES, cfg.MODEL_PRECISION)) throw new Error('model-precision must be fp32, fp16, or int8');
     if (cfg.FORCE && action !== 'download') throw new Error('--force requires --download');
@@ -178,6 +184,27 @@ function normalizeTechnicalTokens(text) {
         .replace(/_/g, ' underscore ').replace(/\\/g, ' backslash ')
         .replace(/\//g, ' slash ').replace(/-/g, ' dash ').replace(/\./g, ' dot ')
         .replace(/[ \t]+/g, ' ').trim();
+}
+
+function loadPronunciations(file) {
+    if (!file) return [];
+    let dictionary;
+    try { dictionary = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch (error) { throw new Error(`pronunciations: cannot read valid JSON from ${file}: ${error.message}`); }
+    if (!dictionary || Array.isArray(dictionary) || typeof dictionary !== 'object') throw new Error('pronunciations: expected a JSON object');
+    const entries = Object.entries(dictionary);
+    if (!entries.every(([key, value]) => typeof key === 'string' && key && typeof value === 'string' && value)) {
+        throw new Error('pronunciations: keys and values must be nonempty strings');
+    }
+    return entries.sort(([a], [b]) => b.length - a.length);
+}
+
+function applyPronunciations(text, entries) {
+    for (const [phrase, spoken] of entries) {
+        const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        text = text.replace(new RegExp(`(?<![\\p{L}\\p{N}_.-])${escaped}(?![\\p{L}\\p{N}_.-])`, 'gu'), spoken);
+    }
+    return text;
 }
 
 function normalizeCurrencies(text) {
@@ -261,35 +288,35 @@ function normalizeMarkdownStructure(text, cfg) {
         }
         content = content.replace(/^[ \t]*[-*+]\s+\[([ xX])\]\s+/, (_, marked) =>
             /x/i.test(marked) ? `${speech.checked} ` : `${speech.unchecked} `)
-            .replace(/^[ \t]*[-*+]\s+/, `${speech.item} `)
+            .replace(/^[ \t]*[-*+]\s+/, '... ')
             .replace(/^[ \t]*(\d+)[.)]\s+/, (_, number) => `${speech.numbered(number)} `);
         return `${`${speech.quote} `.repeat(quotes)}${content}`;
     }).join('\n');
 }
 
 function stripMarkdown(text, cfg) {
+    text = applyPronunciations(text.replace(/\r\n?/g, '\n'), cfg.PRONUNCIATIONS);
     const speech = speechLabels(cfg.LANG);
+    const blocks = [];
+    const protectedBlocks = text.replace(/^(?<fence>`{3}|~{3})[^\n]*\n([\s\S]*?)^\k<fence>[ \t]*$/gm, (_, fence, code) => {
+        const token = `\uE100${blocks.length}\uE101`;
+        blocks.push(cfg.PROFILE === 'technical' ? `\n\n${speech.code}${normalizeTechnicalTokens(code)}\n\n` : `\n\n${speech.codeBlock}\n\n`);
+        return token;
+    });
     const inline = [];
-    const protectedInline = text.replace(/`([^`\n]+)`/g, (_, code) => {
+    const protectedInline = protectedBlocks.replace(/`([^`\n]+)`/g, (_, code) => {
         const token = `\uE000${inline.length}\uE001`;
         inline.push(normalizeTechnicalTokens(code));
         return token;
     });
-    const blocks = [];
-    const protectedBlocks = protectedInline.replace(/^```[^\n]*\n([\s\S]*?)^```\s*$/gm, (_, code) => {
-        const token = `\uE100${blocks.length}\uE101`;
-        blocks.push(cfg.PROFILE === 'technical' ? `\n\n${speech.code}${normalizeTechnicalTokens(code)}\n\n` :
-            `\n\n${speech.codeBlock}\n\n`);
-        return token;
-    });
-    const markdown = normalizeMarkdownStructure(normalizeMarkdownTables(protectedBlocks, cfg), cfg)
+    const markdown = normalizeMarkdownStructure(normalizeMarkdownTables(protectedInline, cfg), cfg)
         .replace(/`([^`]*)`/g, '$1').replace(/^[ \t]*#+[ \t]*/gm, '')
         .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
         .replace(/<\/?[a-zA-Z!][^>]*>/g, '').replace(/\*\*([^*]*)\*\*/g, '$1')
         .replace(/__([^_]*)__/g, '$1').replace(/\*([^*]*)\*/g, '$1')
         .replace(/^[ \t]*[-*=]{3,}[ \t]*$/gm, '').replace(/\n{3,}/g, '\n\n')
-        .replace(/\uE000(\d+)\uE001/g, (_, index) => inline[Number(index)])
-        .replace(/\uE100(\d+)\uE101/g, (_, index) => blocks[Number(index)]);
+        .replace(/\uE100(\d+)\uE101/g, (_, index) => blocks[Number(index)])
+        .replace(/\uE000(\d+)\uE001/g, (_, index) => inline[Number(index)]);
     return normalizeDecimalPoints(normalizeCurrencies(markdown));
 }
 
@@ -310,7 +337,9 @@ class Worker {
     constructor(cfg) {
         const { model, voices } = requireAssets(cfg);
         const python = cfg.PYTHON_PATH || process.env.KOKORO_READER_PYTHON || 'python3';
-        this.proc = spawn(python, [path.join(__dirname, '..', 'python', 'kokoro_worker.py'), '--serve', '--model', model, '--voices', voices], {
+        const args = [path.join(__dirname, '..', 'python', 'kokoro_worker.py'), '--serve', '--model', model, '--voices', voices];
+        if (cfg.THREADS) args.push('--threads', String(cfg.THREADS));
+        this.proc = spawn(python, args, {
             stdio: ['pipe', 'pipe', 'pipe'],
         });
         this.pending = new Map();
@@ -330,22 +359,30 @@ class Worker {
         const pending = this.pending.get(message.id);
         if (!pending) return;
         this.pending.delete(message.id);
+        clearTimeout(pending.timeout);
         if (message.error) pending.reject(new Error(message.error)); else pending.resolve(message);
     }
-    fail(error) { for (const { reject } of this.pending.values()) reject(error); this.pending.clear(); }
+    fail(error) { for (const { reject, timeout } of this.pending.values()) { clearTimeout(timeout); reject(error); } this.pending.clear(); }
     request(message) {
         return new Promise((resolve, reject) => {
             if (this.exited || this.proc.stdin.destroyed || this.proc.stdin.writableEnded) return reject(new Error('Kokoro worker is not running'));
             const id = this.nextId++;
-            this.pending.set(id, { resolve, reject });
+            const timeout = setTimeout(() => {
+                if (!this.pending.delete(id)) return;
+                const error = new Error(`${message.action} timed out after 120 seconds`);
+                this.close();
+                reject(error);
+            }, WORKER_TIMEOUT_MS);
+            this.pending.set(id, { resolve, reject, timeout });
             try {
                 this.proc.stdin.write(JSON.stringify({ id, ...message }) + '\n', error => {
                     if (!error || !this.pending.has(id)) return;
-                    this.pending.delete(id);
+                    clearTimeout(this.pending.get(id).timeout); this.pending.delete(id);
                     reject(error);
                 });
             } catch (error) {
                 this.pending.delete(id);
+                clearTimeout(timeout);
                 reject(error);
             }
         });
@@ -382,6 +419,7 @@ let activeFfplay = null;
 let activeWorker = null;
 let activePartFile = null;
 let playbackPaused = false;
+let liveController = null;
 // The live paragraph's mute, and the callbacks a `resume` has to wake: paragraphs
 // withheld before they started.
 let activePause = null;
@@ -422,6 +460,7 @@ function setupIPC() {
     readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
         if (line.trim() === 'pause') pausePlayback();
         if (line.trim() === 'resume') resumePlayback();
+        if (['previous', 'replay', 'next'].includes(line.trim()) && liveController) liveController.navigate(line.trim());
         if (line.trim() === 'stop') { killActive(); process.exit(0); }
     });
 }
@@ -555,9 +594,58 @@ async function playPreparedUnits(units, worker, cfg) {
     }
 }
 
+class PlaybackController {
+    constructor(text, worker, cfg) {
+        this.text = text; this.worker = worker; this.cfg = cfg;
+        this.index = Math.max(0, cfg.START_PARA - 1); this.generation = 0; this.prefetched = new Map();
+    }
+    navigate(action) {
+        if (action === 'previous') this.index = Math.max(0, this.index - 1);
+        if (action === 'next') this.index = Math.min(this.text.length - 1, this.index + 1);
+        this.generation++;
+        this.prefetched.clear();
+        if (activePause) activePause();
+    }
+    async prepareParagraph(paragraph, generation) {
+        if (this.prefetched.has(paragraph)) return this.prefetched.get(paragraph);
+        const promise = (async () => {
+            const units = await this.worker.prepare(this.text[paragraph], this.cfg);
+            if (generation !== this.generation) return null;
+            const audio = await this.worker.synthesize(units[0], this.cfg);
+            return { units, audio };
+        })();
+        this.prefetched.set(paragraph, promise);
+        return promise;
+    }
+    async run() {
+        while (this.index < this.text.length) {
+            const generation = this.generation;
+            const paragraph = this.index;
+            process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] preparing...`);
+            const prepared = await this.prepareParagraph(paragraph, generation);
+            if (!prepared || generation !== this.generation) continue;
+            for (let unit = 0; unit < prepared.units.length; unit++) {
+                process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] synthesizing...`);
+                const audio = unit === 0 ? prepared.audio : await this.worker.synthesize(prepared.units[unit], this.cfg);
+                if (generation !== this.generation) break;
+                process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] playing...     `);
+                const lookahead = unit === prepared.units.length - 1 && paragraph + 1 < this.text.length ?
+                    this.prepareParagraph(paragraph + 1, generation) : null;
+                await playPCM(audio.pcm, audio.sampleRate, this.cfg);
+                if (lookahead) await lookahead;
+                if (generation !== this.generation) break;
+            }
+            if (generation !== this.generation) continue;
+            this.index++;
+            if (this.index < this.text.length) await delay(PARAGRAPH_PAUSE_MS);
+        }
+    }
+}
+
 async function read(inputFile, cfg) {
-    const raw = inputFile ? fs.readFileSync(inputFile, 'utf8') : await readStdin();
     if (inputFile) setupIPC();
+    const raw = inputFile ? fs.readFileSync(inputFile, 'utf8') : await readStdin();
+    cfg.PRONUNCIATIONS = loadPronunciations(cfg.PRONUNCIATIONS_PATH);
     const text = paragraphs(raw, cfg);
     if (!text.length) throw new Error('Nothing to read.');
     if (cfg.START_PARA > text.length) throw new Error(`start-para must be no greater than the number of paragraphs (${text.length})`);
@@ -581,7 +669,8 @@ async function read(inputFile, cfg) {
                 previousParagraph = unit.paragraph;
             }
         } else {
-            await playPreparedUnits(units, worker, cfg);
+            liveController = new PlaybackController(text, worker, cfg);
+            await liveController.run();
         }
         if (saver) { saver.stdin.end(); await saver.done; }
         process.stderr.write('\n');
@@ -591,6 +680,7 @@ async function read(inputFile, cfg) {
     } finally {
         worker.close();
         activeWorker = null;
+        liveController = null;
         if (inputFile) process.stdin.destroy();
     }
 }

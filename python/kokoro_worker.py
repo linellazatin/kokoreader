@@ -8,6 +8,7 @@ import re
 import sys
 
 import numpy as np
+import onnxruntime as ort
 import phonemizer
 from kokoro_onnx import Kokoro
 from kokoro_onnx.tokenizer import Tokenizer
@@ -35,27 +36,32 @@ NON_LATIN = re.compile('[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff'
 # Ordinary loss is a few percent (stress marks, spaces); Mandarin sits at 22%.
 DROP_WARN = 0.10
 SAFE_PHONEME_LENGTH = 500
+FIRST_PHONEME_LENGTH = 200
 SENTENCE_BREAKS = frozenset('.!?…。！？')
 CLAUSE_BREAKS = frozenset(',;:،，；：')
+
+
+def split_at(remaining, limit):
+    prefix = remaining[:limit]
+    split = max((prefix.rfind(mark) + 1 for mark in SENTENCE_BREAKS), default=0)
+    if not split:
+        split = max((prefix.rfind(mark) + 1 for mark in CLAUSE_BREAKS), default=0)
+    if not split:
+        split = prefix.rfind(' ') + 1
+    return split if split > 0 else limit
 
 
 def split_phonemes(phonemes):
     units = []
     remaining = phonemes
     while remaining:
-        if len(remaining) <= SAFE_PHONEME_LENGTH:
+        limit = FIRST_PHONEME_LENGTH if not units else SAFE_PHONEME_LENGTH
+        if len(remaining) <= limit:
             units.append(remaining)
             break
-        prefix = remaining[:SAFE_PHONEME_LENGTH]
-        split_at = max((prefix.rfind(mark) + 1 for mark in SENTENCE_BREAKS), default=0)
-        if not split_at:
-            split_at = max((prefix.rfind(mark) + 1 for mark in CLAUSE_BREAKS), default=0)
-        if not split_at:
-            split_at = prefix.rfind(' ') + 1
-        if split_at <= 0:
-            split_at = SAFE_PHONEME_LENGTH
-        units.append(remaining[:split_at])
-        remaining = remaining[split_at:]
+        boundary = split_at(remaining, limit)
+        units.append(remaining[:boundary])
+        remaining = remaining[boundary:]
     return [unit for unit in units if unit]
 
 
@@ -88,7 +94,7 @@ def check_lang(lang, voice, names):
         'Run kokoreader --list-languages for the codes this install accepts.')
 
 
-def synth_warning(text, lang, tokenizer, names):
+def synth_warning(text, lang, phonemes, names):
     """Report what espeak-ng could not read, which is otherwise silent quality loss."""
     if lang in LATIN_ONLY:
         foreign = ''.join(dict.fromkeys(NON_LATIN.findall(text)))[:12]
@@ -99,10 +105,9 @@ def synth_warning(text, lang, tokenizer, names):
     # phonemize() returns one joined string here, not a list of utterances.
     raw = phonemizer.phonemize(
         Tokenizer.normalize_text(text), lang, preserve_punctuation=True, with_stress=True)
-    kept = tokenizer.phonemize(text, lang)
-    if not kept:
+    if not phonemes:
         return f'lang "{lang}" produced no phonemes for this text; check the espeak-ng dictionary'
-    dropped = 1 - len(kept) / len(raw) if raw else 0
+    dropped = 1 - len(phonemes) / len(raw) if raw else 0
     switched = sorted(set(LANG_SWITCH.findall(raw)))
     if switched:
         return (f"espeak-ng read part of this text as {'/'.join(switched)}, not "
@@ -124,8 +129,16 @@ def main():
     parser.add_argument('--serve', action='store_true', required=True)
     parser.add_argument('--model', required=True)
     parser.add_argument('--voices', required=True)
+    parser.add_argument('--threads', type=int, default=0)
     args = parser.parse_args()
-    kokoro = Kokoro(args.model, args.voices)
+    options = ort.SessionOptions()
+    if args.threads:
+        options.intra_op_num_threads = args.threads
+        options.inter_op_num_threads = 1
+        options.add_session_config_entry('session.intra_op.allow_spinning', '0')
+        options.add_session_config_entry('session.inter_op.allow_spinning', '0')
+    session = ort.InferenceSession(args.model, sess_options=options)
+    kokoro = Kokoro.from_session(session, args.voices)
     names = EspeakBackend.supported_languages()
 
     for line in sys.stdin:
@@ -145,9 +158,10 @@ def main():
                       'espeak': names})
             elif request['action'] == 'prepare':
                 check_lang(request['lang'], request['voice'], names)
-                warning = synth_warning(request['text'], request['lang'], kokoro.tokenizer, names)
+                phonemes = kokoro.tokenizer.phonemize(request['text'], request['lang'])
+                warning = synth_warning(request['text'], request['lang'], phonemes, names)
                 response = {'id': request_id,
-                            'units': prepare(request['text'], request['lang'], kokoro.tokenizer)}
+                            'units': split_phonemes(phonemes)}
                 if warning:
                     response['warning'] = warning
                 emit(response)
@@ -172,13 +186,13 @@ def selfcheck():
     assert NON_LATIN.search('Hello 世界 world.')
     assert not NON_LATIN.search('Caffè Crème ñü ế')  # accented Latin is still Latin
     assert ''.join(dict.fromkeys(NON_LATIN.findall('世界 a 世界'))) == '世界'
-    assert split_phonemes('a' * 500) == ['a' * 500]
-    assert [len(unit) for unit in split_phonemes('a' * 501)] == [500, 1]
+    assert [len(unit) for unit in split_phonemes('a' * 500)] == [200, 300]
+    assert [len(unit) for unit in split_phonemes('a' * 501)] == [200, 301]
     source = ('a' * 503) + ' b' + ('c' * 503)
     units = split_phonemes(source)
     assert ''.join(units) == source
     assert all(0 < len(unit) <= SAFE_PHONEME_LENGTH for unit in units)
-    assert split_phonemes('a' * 490 + '. ' + 'b' * 20) == ['a' * 490 + '.', ' ' + 'b' * 20]
+    assert split_phonemes('a' * 190 + '. ' + 'b' * 20) == ['a' * 190 + '.', ' ' + 'b' * 20]
     assert error_response(7, ValueError('bad'), 'language warning') == {
         'id': 7, 'error': 'bad', 'warning': 'language warning'
     }

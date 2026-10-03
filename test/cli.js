@@ -662,8 +662,18 @@ run('block quotes and task lists receive structural speech markers', () => {
     fs.rmSync(paths.dir, { recursive: true, force: true });
     assert(JSON.stringify(prepared) === JSON.stringify([
         'Quote. Quoted text.',
-        'Unchecked item. Draft task.\nChecked item. Finished task.\nItem. Plain item.\nItem 1. Numbered item.',
+        'Unchecked item. Draft task.\nChecked item. Finished task.\n... Plain item.\nItem 1. Numbered item.',
     ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('unordered list markers become a short pause while ordered lists retain numbering', () => {
+    const paths = stubs({ text: '- Alpha\n1. Beta\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).find(event => event.action === 'prepare');
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(prepared.text === '... Alpha\nItem 1. Beta', `prepared text: ${JSON.stringify(prepared.text)}`);
 });
 
 run('nested task lists inside block quotes retain both speech markers', () => {
@@ -698,7 +708,8 @@ run('supported voice languages localize inserted Markdown speech labels', () => 
         });
         const prepared = stubEvents(technical).filter(event => event.action === 'prepare').map(event => event.text);
         fs.rmSync(technical.dir, { recursive: true, force: true });
-        assert(JSON.stringify(prepared) === JSON.stringify(labels.slice(0, 5)), `${lang} technical labels: ${JSON.stringify(prepared)}`);
+        assert(JSON.stringify(prepared.slice(0, 4)) === JSON.stringify(labels.slice(0, 4)), `${lang} technical labels: ${JSON.stringify(prepared)}`);
+        assert(prepared[4].includes('\n... p.') && !prepared[4].includes('\nItem. p.'), `${lang} unordered-list pause: ${JSON.stringify(prepared[4])}`);
 
         const narrative = stubs({ text: '```text\nx\n```\n' });
         spawnSync(process.execPath, [CLI, ...cliArgs(narrative), '--lang', lang, '--profile', 'narrative', '--output', path.join(narrative.dir, 'o.wav'), narrative.input], {
@@ -890,6 +901,68 @@ run('worker prepares source text before synthesizing every safe unit', () => {
         `actions: ${JSON.stringify(events.map(event => event.action))}`);
     assert(JSON.stringify(events.filter(event => event.action === 'synthesize').map(event => event.phonemes)) === JSON.stringify(['one', 'two']),
         'prepared units were not synthesized in order');
+});
+
+run('CRLF paragraphs, nested inline tokens, and matched tilde fences are normalized', () => {
+    const paths = stubs({ text: 'Before.\r\n\r\n~~~js\r\nconst `name` = nmnm.jsonc;\r\n~~~\r\n\r\nAfter.\r' });
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], { env: { ...process.env, ...stubEnv(paths) } });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status === 0, result.stderr);
+    assert(JSON.stringify(prepared) === JSON.stringify(['Before.', 'The code is .. const `name` = nmnm dot jsonc;', 'After.']), JSON.stringify(prepared));
+});
+
+run('unclosed tilde fences remain literal source text', () => {
+    const paths = stubs({ text: '~~~\nnot closed\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], { env: { ...process.env, ...stubEnv(paths) } });
+    const prepared = stubEvents(paths).find(event => event.action === 'prepare');
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(prepared.text.includes('~~~'), JSON.stringify(prepared));
+});
+
+run('worker requests time out and name their action', () => {
+    const source = fs.readFileSync(CLI, 'utf8');
+    assert(source.includes('WORKER_TIMEOUT_MS = 120000'), 'worker timeout constant missing');
+    assert(source.includes('${message.action} timed out after 120 seconds'), 'worker timeout does not name the request action');
+});
+
+run('threads and pronunciation options validate and extension forwards them', () => {
+    const invalid = cli(['--threads', '-1']);
+    const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    assert(invalid.status !== 0 && invalid.stderr.includes('threads must be a non-negative integer'), invalid.stderr);
+    assert(source.includes("add('--threads', 'threads')") && source.includes("add('--pronunciations', 'pronunciationsPath')"), 'extension config forwarding missing');
+    assert(manifest.contributes.configuration.properties['kokoreader.threads'], 'threads setting missing');
+    assert(manifest.contributes.configuration.properties['kokoreader.pronunciationsPath'], 'pronunciations setting missing');
+});
+
+run('pronunciations apply before markdown and use longest whole literal match', () => {
+    const paths = stubs({ text: '`nmnm.jsonc` nmnm.jsonc nmnm.jsoncx\n' });
+    const dictionary = path.join(paths.dir, 'pronunciations.json');
+    fs.writeFileSync(dictionary, JSON.stringify({ 'nmnm': 'short', 'nmnm.jsonc': 'long phrase' }));
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--pronunciations', dictionary, '--output', path.join(paths.dir, 'o.wav'), paths.input], { env: { ...process.env, ...stubEnv(paths) } });
+    const prepared = stubEvents(paths).find(event => event.action === 'prepare');
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status === 0, result.stderr);
+    assert(prepared.text.includes('long phrase long phrase nmnm.jsoncx'), prepared.text);
+});
+
+run('invalid pronunciation dictionaries fail before worker startup', () => {
+    const paths = stubs();
+    const dictionary = path.join(paths.dir, 'pronunciations.json');
+    fs.writeFileSync(dictionary, JSON.stringify({ '': 'bad' }));
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--pronunciations', dictionary, paths.input], { env: { ...process.env, ...stubEnv(paths) } });
+    const started = stubEvents(paths).some(event => event.tool === 'worker');
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status !== 0 && result.stderr.includes('pronunciations'), result.stderr);
+    assert(!started, 'worker started before dictionary validation');
+});
+
+run('extension manifest exposes paragraph navigation without default bindings', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    const commands = manifest.contributes.commands.map(command => command.command);
+    for (const command of ['kokoreader.previousParagraph', 'kokoreader.replayParagraph', 'kokoreader.nextParagraph']) assert(commands.includes(command), command);
+    assert(!manifest.contributes.keybindings, 'navigation must not add default keybindings');
 });
 
 run('live playback synthesizes the next unit before the current player exits', () => {
