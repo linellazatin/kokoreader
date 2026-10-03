@@ -1009,6 +1009,70 @@ run('navigation during synthesis replaces the worker and plays only the selected
     }
 });
 
+run('previous during synthesis plays only the preceding paragraph', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n\nThird.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), '--start-para', '2', paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '1000' },
+    });
+    child.stderr.resume();
+    try {
+        assert(waitFor(() => stubEvents(paths).some(event => event.action === 'prepare' && event.text === 'Second.')),
+            'starting paragraph was not prepared');
+        child.stdin.write('previous\n');
+        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'worker').length >= 2), 'previous did not replace the worker');
+        assert(waitFor(() => stubEvents(paths).some(event => event.action === 'synthesize' && event.phonemes === 'First.')),
+            'previous paragraph was not synthesized');
+        assert(!stubEvents(paths).some(event => event.action === 'synthesize' && event.phonemes === 'Second.'),
+            `stale paragraph was synthesized: ${JSON.stringify(stubEvents(paths))}`);
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('replay during playback restarts only the current paragraph', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '1000' },
+    });
+    child.stderr.resume();
+    try {
+        assert(waitFor(() => stubEvents(paths).some(event => event.tool === 'ffplay')), 'current paragraph did not begin playback');
+        child.stdin.write('replay\n');
+        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'worker').length >= 2), `replay did not replace the worker: ${JSON.stringify(stubEvents(paths))}`);
+        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'ffplay').length >= 2), 'replay did not restart playback');
+        const replayWorker = stubEvents(paths).map((event, index) => ({ event, index }))
+            .filter(({ event }) => event.tool === 'worker')[1].index;
+        assert(!stubEvents(paths).slice(replayWorker + 1).some(event => event.action === 'synthesize' && event.phonemes === 'Second.'),
+            `replay worker synthesized the next paragraph: ${JSON.stringify(stubEvents(paths))}`);
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('navigation from pause keeps playback withheld until resume', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), '--start-para', '2', paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '80' },
+    });
+    child.stderr.resume();
+    try {
+        assert(waitFor(() => stubEvents(paths).some(event => event.action === 'prepare' && event.text === 'Second.')),
+            'starting paragraph was not prepared');
+        child.stdin.write('pause\nprevious\n');
+        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'worker').length >= 2), 'navigation did not replace the worker while paused');
+        sleepSync(500);
+        assert(!stubEvents(paths).some(event => event.tool === 'ffplay'), 'paused navigation started playback');
+        child.stdin.write('resume\n');
+        assert(waitFor(() => stubEvents(paths).some(event => event.tool === 'ffplay')), 'resume did not play the selected paragraph');
+        assert(stubEvents(paths).some(event => event.action === 'synthesize' && event.phonemes === 'First.'), 'previous paragraph was not selected');
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
 run('failed lookahead prevents or stops active playback immediately', () => {
     const paths = stubs({ text: 'First.\n\nSecond.\n' });
     const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {

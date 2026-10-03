@@ -218,15 +218,15 @@ function normalizeDecimalPoints(text) {
 }
 
 const SPEECH_LABELS = Object.freeze({
-    'en-us': { code: 'The code is - ', codeBlock: 'A code block follows. You can see the code in the document.', table: 'Table.', columns: 'Columns:', row: n => `Row ${n}.`, column: n => `Column ${n}`, blank: 'blank', quote: 'Quote.', checked: 'Checked item.', unchecked: 'Unchecked item.', item: 'Item.', numbered: n => `Item ${n}.` },
-    'en-gb': { code: 'The code is - ', codeBlock: 'A code block follows. You can see the code in the document.', table: 'Table.', columns: 'Columns:', row: n => `Row ${n}.`, column: n => `Column ${n}`, blank: 'blank', quote: 'Quote.', checked: 'Checked item.', unchecked: 'Unchecked item.', item: 'Item.', numbered: n => `Item ${n}.` },
-    es: { code: 'El código es. ', codeBlock: 'Sigue un bloque de código. Puedes ver el código en el documento.', table: 'Tabla.', columns: 'Columnas:', row: n => `Fila ${n}.`, column: n => `Columna ${n}`, blank: 'vacío', quote: 'Cita.', checked: 'Elemento marcado.', unchecked: 'Elemento sin marcar.', item: 'Elemento.', numbered: n => `Elemento ${n}.` },
-    'fr-fr': { code: 'Le code est. ', codeBlock: 'Un bloc de code suit. Vous pouvez voir le code dans le document.', table: 'Tableau.', columns: 'Colonnes:', row: n => `Ligne ${n}.`, column: n => `Colonne ${n}`, blank: 'vide', quote: 'Citation.', checked: 'Élément coché.', unchecked: 'Élément non coché.', item: 'Élément.', numbered: n => `Élément ${n}.` },
-    hi: { code: 'कोड है। ', codeBlock: 'आगे एक कोड ब्लॉक है। आप दस्तावेज़ में कोड देख सकते हैं।', table: 'तालिका।', columns: 'स्तंभ:', row: n => `पंक्ति ${n}.`, column: n => `स्तंभ ${n}`, blank: 'खाली', quote: 'उद्धरण।', checked: 'चेक किया गया आइटम।', unchecked: 'अनचेक किया गया आइटम।', item: 'आइटम।', numbered: n => `आइटम ${n}.` },
-    it: { code: 'Il codice è. ', codeBlock: 'Segue un blocco di codice. Puoi vedere il codice nel documento.', table: 'Tabella.', columns: 'Colonne:', row: n => `Riga ${n}.`, column: n => `Colonna ${n}`, blank: 'vuoto', quote: 'Citazione.', checked: 'Elemento selezionato.', unchecked: 'Elemento non selezionato.', item: 'Elemento.', numbered: n => `Elemento ${n}.` },
-    ja: { code: 'コードです。 ', codeBlock: 'コードブロックが続きます。ドキュメントでコードを確認できます。', table: '表。', columns: '列:', row: n => `行 ${n}。`, column: n => `列 ${n}`, blank: '空欄', quote: '引用。', checked: 'チェック済みの項目。', unchecked: '未チェックの項目。', item: '項目。', numbered: n => `項目 ${n}。` },
-    'pt-br': { code: 'O código é. ', codeBlock: 'Segue um bloco de código. Você pode ver o código no documento.', table: 'Tabela.', columns: 'Colunas:', row: n => `Linha ${n}.`, column: n => `Coluna ${n}`, blank: 'em branco', quote: 'Citação.', checked: 'Item marcado.', unchecked: 'Item não marcado.', item: 'Item.', numbered: n => `Item ${n}.` },
-    cmn: { code: '代码是。 ', codeBlock: '接下来是代码块。您可以在文档中查看代码。', table: '表格。', columns: '列：', row: n => `第 ${n} 行。`, column: n => `第 ${n} 列`, blank: '空白', quote: '引用。', checked: '已选中项目。', unchecked: '未选中项目。', item: '项目。', numbered: n => `项目 ${n}。` },
+    'en-us': { code: 'The code is - ', codeBlock: 'A code block follows. You can see the code in the document.', table: 'Table.', columns: 'Columns:', row: n => `Row ${n}.`, column: n => `Column ${n}`, blank: 'blank', quote: 'Quote.', checked: 'Checked item.', unchecked: 'Unchecked item.', numbered: n => `Item ${n}.` },
+    'en-gb': { code: 'The code is - ', codeBlock: 'A code block follows. You can see the code in the document.', table: 'Table.', columns: 'Columns:', row: n => `Row ${n}.`, column: n => `Column ${n}`, blank: 'blank', quote: 'Quote.', checked: 'Checked item.', unchecked: 'Unchecked item.', numbered: n => `Item ${n}.` },
+    es: { code: 'El código es. ', codeBlock: 'Sigue un bloque de código. Puedes ver el código en el documento.', table: 'Tabla.', columns: 'Columnas:', row: n => `Fila ${n}.`, column: n => `Columna ${n}`, blank: 'vacío', quote: 'Cita.', checked: 'Elemento marcado.', unchecked: 'Elemento sin marcar.', numbered: n => `Elemento ${n}.` },
+    'fr-fr': { code: 'Le code est. ', codeBlock: 'Un bloc de code suit. Vous pouvez voir le code dans le document.', table: 'Tableau.', columns: 'Colonnes:', row: n => `Ligne ${n}.`, column: n => `Colonne ${n}`, blank: 'vide', quote: 'Citation.', checked: 'Élément coché.', unchecked: 'Élément non coché.', numbered: n => `Élément ${n}.` },
+    hi: { code: 'कोड है। ', codeBlock: 'आगे एक कोड ब्लॉक है। आप दस्तावेज़ में कोड देख सकते हैं।', table: 'तालिका।', columns: 'स्तंभ:', row: n => `पंक्ति ${n}.`, column: n => `स्तंभ ${n}`, blank: 'खाली', quote: 'उद्धरण।', checked: 'चेक किया गया आइटम।', unchecked: 'अनचेक किया गया आइटम।', numbered: n => `आइटम ${n}.` },
+    it: { code: 'Il codice è. ', codeBlock: 'Segue un blocco di codice. Puoi vedere il codice nel documento.', table: 'Tabella.', columns: 'Colonne:', row: n => `Riga ${n}.`, column: n => `Colonna ${n}`, blank: 'vuoto', quote: 'Citazione.', checked: 'Elemento selezionato.', unchecked: 'Elemento non selezionato.', numbered: n => `Elemento ${n}.` },
+    ja: { code: 'コードです。 ', codeBlock: 'コードブロックが続きます。ドキュメントでコードを確認できます。', table: '表。', columns: '列:', row: n => `行 ${n}。`, column: n => `列 ${n}`, blank: '空欄', quote: '引用。', checked: 'チェック済みの項目。', unchecked: '未チェックの項目。', numbered: n => `項目 ${n}。` },
+    'pt-br': { code: 'O código é. ', codeBlock: 'Segue um bloco de código. Você pode ver o código no documento.', table: 'Tabela.', columns: 'Colunas:', row: n => `Linha ${n}.`, column: n => `Coluna ${n}`, blank: 'em branco', quote: 'Citação.', checked: 'Item marcado.', unchecked: 'Item não marcado.', numbered: n => `Item ${n}.` },
+    cmn: { code: '代码是。 ', codeBlock: '接下来是代码块。您可以在文档中查看代码。', table: '表格。', columns: '列：', row: n => `第 ${n} 行。`, column: n => `第 ${n} 列`, blank: '空白', quote: '引用。', checked: '已选中项目。', unchecked: '未选中项目。', numbered: n => `项目 ${n}。` },
 });
 
 function speechLabels(lang) {
@@ -525,8 +525,8 @@ function playSegment(pcm, offset, sampleRate, cfg) {
         ffmpeg.stdout.pipe(ffplay.stdin);
         ffmpeg.on('error', error => settle(0, error));
         ffplay.on('error', error => settle(0, error));
-        ffmpeg.on('exit', code => { ffmpegDone = true; if (code !== 0) settle(0, new Error(`ffmpeg exited with code ${code}`)); else if (ffplayDone) settle(pcm.length); });
-        ffplay.on('exit', code => { ffplayDone = true; if (code !== 0) settle(0, new Error(`ffplay exited with code ${code}`)); else if (ffmpegDone) settle(pcm.length); });
+        ffmpeg.on('exit', code => { ffmpegDone = true; if (playbackCancelled) settle(pcm.length); else if (code !== 0) settle(0, new Error(`ffmpeg exited with code ${code}`)); else if (ffplayDone) settle(pcm.length); });
+        ffplay.on('exit', code => { ffplayDone = true; if (playbackCancelled) settle(pcm.length); else if (code !== 0) settle(0, new Error(`ffplay exited with code ${code}`)); else if (ffmpegDone) settle(pcm.length); });
         activePause = pause;
     });
 }

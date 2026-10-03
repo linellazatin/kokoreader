@@ -72,11 +72,8 @@ def error_response(request_id, error, warning):
     return response
 
 
-def prepare(text, lang, tokenizer):
-    phonemes = tokenizer.phonemize(text, lang)
-    if not phonemes:
-        raise ValueError(f'lang "{lang}" produced no phonemes for this text; check the espeak-ng dictionary')
-    return split_phonemes(phonemes)
+def filter_phonemes(raw, vocab):
+    return ''.join(phoneme for phoneme in raw if phoneme in vocab).strip()
 
 
 def emit(message):
@@ -94,7 +91,7 @@ def check_lang(lang, voice, names):
         'Run kokoreader --list-languages for the codes this install accepts.')
 
 
-def synth_warning(text, lang, phonemes, names):
+def synth_warning(text, lang, raw, phonemes, names):
     """Report what espeak-ng could not read, which is otherwise silent quality loss."""
     if lang in LATIN_ONLY:
         foreign = ''.join(dict.fromkeys(NON_LATIN.findall(text)))[:12]
@@ -102,9 +99,6 @@ def synth_warning(text, lang, phonemes, names):
             return (f'espeak-ng cannot read "{foreign}" with lang "{lang}" (Latin dictionaries '
                     'only), so that text is spelled out in English instead. Set --lang to the '
                     'language of the text.')
-    # phonemize() returns one joined string here, not a list of utterances.
-    raw = phonemizer.phonemize(
-        Tokenizer.normalize_text(text), lang, preserve_punctuation=True, with_stress=True)
     if not phonemes:
         return f'lang "{lang}" produced no phonemes for this text; check the espeak-ng dictionary'
     dropped = 1 - len(phonemes) / len(raw) if raw else 0
@@ -158,8 +152,10 @@ def main():
                       'espeak': names})
             elif request['action'] == 'prepare':
                 check_lang(request['lang'], request['voice'], names)
-                phonemes = kokoro.tokenizer.phonemize(request['text'], request['lang'])
-                warning = synth_warning(request['text'], request['lang'], phonemes, names)
+                raw = phonemizer.phonemize(
+                    Tokenizer.normalize_text(request['text']), request['lang'], preserve_punctuation=True, with_stress=True)
+                phonemes = filter_phonemes(raw, kokoro.tokenizer.vocab)
+                warning = synth_warning(request['text'], request['lang'], raw, phonemes, names)
                 response = {'id': request_id,
                             'units': split_phonemes(phonemes)}
                 if warning:
@@ -186,6 +182,7 @@ def selfcheck():
     assert NON_LATIN.search('Hello 世界 world.')
     assert not NON_LATIN.search('Caffè Crème ñü ế')  # accented Latin is still Latin
     assert ''.join(dict.fromkeys(NON_LATIN.findall('世界 a 世界'))) == '世界'
+    assert filter_phonemes('a?b', {'a': 1, 'b': 2}) == 'ab'
     assert [len(unit) for unit in split_phonemes('a' * 500)] == [200, 300]
     assert [len(unit) for unit in split_phonemes('a' * 501)] == [200, 301]
     source = ('a' * 503) + ' b' + ('c' * 503)
