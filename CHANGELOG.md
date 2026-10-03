@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+- Added paragraph navigation commands for previous, replay, and next in the CLI IPC and VS Code/VSCodium. They have no default keybindings and retain paused state.
+- Added local pronunciation dictionaries through `--pronunciations`, `PRONUNCIATIONS_PATH`, and `kokoreader.pronunciationsPath`.
+- Added optional ONNX Runtime CPU caps through `--threads`, `THREADS`, and `kokoreader.threads`; `0` preserves automatic selection.
+- Failed extension reads and exports append one privacy-preserving JSON Lines record to `logs/err.jsonl` beside the installed extension; VS Code/VSCodium log storage is used only when that directory is not writable.
+
+### Fixed
+- Navigation now cancels the source paragraph gap immediately and terminates replaced workers with a bounded graceful shutdown followed by forced termination when needed.
+- Pronunciation dictionaries now use one longest-first match against original source text, so replacement text cannot cascade into a later dictionary entry.
+- The worker now reports readiness after model startup; stalled startup fails after 20 seconds instead of consuming the first request's 120-second deadline.
+- Extension error logs rotate at 1 MiB and retain one previous `err.jsonl.1` file.
+- Unordered Markdown list items now use a short pause instead of speaking an “Item” marker. Ordered-list numbering and task-state announcements are unchanged.
+- Normalized CRLF and classic CR input before Markdown parsing, restored fenced-code placeholders before inline placeholders, and added matched tilde-fence support while preserving unclosed fences literally.
+- Added a 120-second worker-request deadline with controlled cleanup and action-specific errors.
+- Reduced first-audio work by splitting the first phoneme unit at an early natural boundary while retaining later safe boundaries.
+- Navigation now cancels stale playback cleanly, including replay during active audio and navigation while paused.
+- File-read validation failures now close the extension control pipe, so missing assets, invalid dictionaries, empty text, and invalid start paragraphs cannot leave the editor reading state stuck.
+- Reused the worker's raw phonemization result for vocabulary filtering and pronunciation warnings.
+
 ## 0.2.0
 
 ### Added

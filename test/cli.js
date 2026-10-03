@@ -33,6 +33,7 @@ function extensionHarness(activeEditor, options = {}) {
     const spawned = [];
     const contexts = [];
     const errors = [];
+    const statusItems = [];
     const uri = file => ({ fsPath: file, scheme: 'file', toString: () => `file://${file}` });
     const vscode = {
         StatusBarAlignment: { Left: 1 },
@@ -41,10 +42,14 @@ function extensionHarness(activeEditor, options = {}) {
             executeCommand(...args) { contexts.push(args); },
             registerCommand(name, handler) { commands.set(name, handler); return { dispose() {} }; },
         },
-        workspace: { getConfiguration: () => ({ get: name => ({ pythonPath: '/python', modelDir: '/models', format: 'wav' }[name]) }) },
+        workspace: { getConfiguration: () => ({ get: name => ({ pythonPath: '/python', modelDir: '/models', format: 'wav', debug: false, ...options.configuration }[name]) }) },
         window: {
             activeTextEditor: activeEditor,
-            createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
+            createStatusBarItem: () => {
+                const item = { text: '', show() {}, hide() {}, dispose() {} };
+                statusItems.push(item);
+                return item;
+            },
             showSaveDialog: options.showSaveDialog || (async () => uri('/tmp/kokoreader-output.wav')),
             showErrorMessage(message) { errors.push(message); }, showInformationMessage() {},
         },
@@ -64,8 +69,12 @@ function extensionHarness(activeEditor, options = {}) {
     };
     try {
         const extension = require(extensionPath);
-        extension.activate({ subscriptions: { push() {} } });
-        return { commands, spawned, contexts, errors, extension, uri };
+        extension.activate({
+            subscriptions: { push() {} },
+            extensionPath: options.extensionPath || path.join(ROOT, 'extension'),
+            logUri: uri(options.logPath || path.join(os.tmpdir(), 'kokoreader-test-logs')),
+        });
+        return { commands, spawned, contexts, errors, statusItems, extension, uri };
     } finally {
         Module._load = originalLoad;
         delete require.cache[extensionPath];
@@ -102,6 +111,12 @@ const fs = require('fs'), readline = require('readline');
 const events = ${JSON.stringify(paths.events)};
 const delay = Number(process.env.KKR_STUB_SYNTH_DELAY || 0);
 fs.appendFileSync(events, JSON.stringify({ tool: 'worker', pid: process.pid }) + '\\n');
+const ready = () => {
+  fs.appendFileSync(events, JSON.stringify({ tool: 'worker-ready', at: Date.now() }) + '\\n');
+  process.stdout.write(JSON.stringify({ ready: true }) + '\\n');
+};
+const readyDelay = Number(process.env.KKR_STUB_READY_DELAY || 0);
+readyDelay ? setTimeout(ready, readyDelay) : ready();
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const request = JSON.parse(line);
   fs.appendFileSync(events, JSON.stringify({ ...request, at: Date.now() }) + '\\n');
@@ -266,7 +281,7 @@ fs.mkdirSync(tools);
 fs.writeFileSync(input, 'A short selection.');
 fs.writeFileSync(model, 'model');
 fs.writeFileSync(voices, 'voices');
-fs.writeFileSync(worker, '#!/usr/bin/env node\nconst readline = require("readline");\nreadline.createInterface({ input: process.stdin }).on("line", line => { const request = JSON.parse(line); const response = request.action === "prepare" ? { id: request.id, units: [request.text] } : { id: request.id, pcm: "AAA=", sampleRate: 24000 }; process.stdout.write(JSON.stringify(response) + "\\n"); });\n');
+fs.writeFileSync(worker, '#!/usr/bin/env node\nconst readline = require("readline");\nprocess.stdout.write(JSON.stringify({ ready: true }) + "\\n");\nreadline.createInterface({ input: process.stdin }).on("line", line => { const request = JSON.parse(line); const response = request.action === "prepare" ? { id: request.id, units: [request.text] } : { id: request.id, pcm: "AAA=", sampleRate: 24000 }; process.stdout.write(JSON.stringify(response) + "\\n"); });\n');
 fs.writeFileSync(path.join(tools, 'ffmpeg'), '#!/usr/bin/env node\nconst fs = require("fs");\nconst out = process.argv[process.argv.length - 1];\nif (out !== "pipe:1") process.stdin.on("data", c => fs.appendFileSync(out, c));\nprocess.stdin.on("end", () => process.exit(0));\n');
 fs.chmodSync(worker, 0o755);
 fs.chmodSync(path.join(tools, 'ffmpeg'), 0o755);
@@ -283,6 +298,27 @@ setTimeout(() => { child.kill(); cleanup(); process.exit(1); }, 5000);
     assert(result.status === 0, `file-reading child did not exit: ${result.stderr}`);
 });
 
+run('file-read validation failures close the extension IPC pipe', () => {
+    const probe = String.raw`
+const { spawn } = require('child_process');
+const path = require('path');
+const root = process.argv[1];
+const args = JSON.parse(process.argv[2]);
+const child = spawn(process.execPath, [path.join(root, 'bin', 'kokoreader.js'), ...args], { stdio: ['pipe', 'ignore', 'pipe'] });
+child.stderr.resume();
+child.on('exit', code => process.exit(code === 0 ? 2 : 0));
+setTimeout(() => { child.kill(); process.exit(1); }, 1500);
+`;
+    for (const args of [
+        ['--start-para', '999', 'package.json'],
+        ['--pronunciations', '/missing/kokoreader-pronunciations.json', 'package.json'],
+        ['--model', '/missing/kokoreader-model.onnx', '--voices', '/missing/kokoreader-voices.bin', 'package.json'],
+    ]) {
+        const result = spawnSync(process.execPath, ['-e', probe, ROOT, JSON.stringify(args)], { cwd: ROOT, encoding: 'utf8', timeout: 4000 });
+        assert(result.status === 0, `file-read validation left IPC open for ${args.join(' ')}: ${result.stderr}`);
+    }
+});
+
 run('extension manifest exposes read, playback, and save commands', () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
     const commands = manifest.contributes.commands.map(command => command.command);
@@ -297,7 +333,7 @@ run('extension save command and format setting are format-neutral', () => {
     const save = manifest.contributes.commands.find(command => command.command === 'kokoreader.saveFile');
     assert(save.title.endsWith('Save to File'), `unexpected title: ${save.title}`);
     assert(manifest.contributes.configuration.properties['kokoreader.format'].description.includes('Save to File'), 'format setting does not describe Save to File');
-    assert(source.includes("process.on('error', error => { item.dispose()"), 'save process errors are not handled');
+    assert(source.includes("process.on('error', error => {") && source.includes("kind: 'export'"), 'save process errors are not handled');
 });
 
 run('cursor command reads from the active cursor through document end', () => {
@@ -475,11 +511,119 @@ run('pause cuts the player and resume replays the paragraph from the remembered 
 run('extension reports a failed reader exit and can surface worker errors', () => {
     const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-    assert(/proc\.on\('exit', code =>/.test(source), 'reader exit code is still ignored');
+    assert(/proc\.on\('exit', \(code, signal\) =>/.test(source), 'reader exit code or signal is still ignored');
     assert(source.includes('Kokoreader: reader failed'), 'failed reader exit is not shown to the user');
-    assert(source.includes("lastLine.indexOf('Error: ')"), 'error detail is parsed only from the start of a line the progress text shares');
+    assert(source.includes("error.indexOf('Error: ')"), 'error detail is not parsed from stderr independently of progress');
     assert(source.includes("'--debug'"), 'worker debug output cannot be forwarded');
     assert(manifest.contributes.configuration.properties['kokoreader.debug'].order === 17, 'debug setting is not ordered last');
+});
+
+run('reader failures always append a source-free extension error record', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-error-log-'));
+    const extensionPath = path.join(dir, 'extension');
+    const activePath = path.join(dir, 'input.md');
+    fs.mkdirSync(extensionPath);
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: activePath, scheme: 'file', toString: () => `file://${activePath}` }, fileName: activePath, getText: () => 'text' },
+    }, { extensionPath });
+    try {
+        harness.commands.get('kokoreader.readFile')();
+        const child = harness.spawned[0].child;
+        child.stderr.emit('data', Buffer.from('Error: worker failed near source text'));
+        child.emit('exit', 1);
+        const log = path.join(extensionPath, 'logs', 'err.jsonl');
+        assert(fs.existsSync(log), 'debug reader failure did not create err.jsonl');
+        const entry = JSON.parse(fs.readFileSync(log, 'utf8'));
+        assert(entry.kind === 'reader' && entry.code === 1 && !JSON.stringify(entry).includes('source text'), JSON.stringify(entry));
+    } finally {
+        harness.extension.deactivate();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+run('extension error logs rotate before they grow without bound', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-error-log-'));
+    const extensionPath = path.join(dir, 'extension');
+    const activePath = path.join(dir, 'input.md');
+    fs.mkdirSync(path.join(extensionPath, 'logs'), { recursive: true });
+    const log = path.join(extensionPath, 'logs', 'err.jsonl');
+    fs.writeFileSync(log, 'x'.repeat(1024 * 1024));
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: activePath, scheme: 'file', toString: () => `file://${activePath}` }, fileName: activePath, getText: () => 'text' },
+    }, { extensionPath });
+    try {
+        harness.commands.get('kokoreader.readFile')();
+        harness.spawned[0].child.emit('exit', 1);
+        const archived = path.join(extensionPath, 'logs', 'err.jsonl.1');
+        assert(fs.existsSync(archived), 'oversized error log was not rotated');
+        assert(fs.statSync(archived).size === 1024 * 1024, 'rotated log did not retain the old records');
+        assert(JSON.parse(fs.readFileSync(log, 'utf8')).kind === 'reader', 'new error record was not written to a fresh log');
+    } finally {
+        harness.extension.deactivate();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+run('export failures always append an extension error record', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-error-log-'));
+    const extensionPath = path.join(dir, 'extension');
+    const sourcePath = path.join(dir, 'input.md');
+    fs.mkdirSync(extensionPath);
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'text' },
+    }, { extensionPath });
+    try {
+        await harness.commands.get('kokoreader.saveFile')();
+        harness.spawned[0].child.emit('exit', 1);
+        const log = path.join(extensionPath, 'logs', 'err.jsonl');
+        assert(fs.existsSync(log), 'debug export failure did not create err.jsonl');
+        const entry = JSON.parse(fs.readFileSync(log, 'utf8'));
+        assert(entry.kind === 'export' && entry.code === 1, JSON.stringify(entry));
+    } finally {
+        harness.extension.deactivate();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+run('extension error logging falls back when its install directory is unwritable', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-error-log-'));
+    const extensionPath = path.join(dir, 'extension');
+    const logPath = path.join(dir, 'fallback');
+    const activePath = path.join(dir, 'input.md');
+    fs.mkdirSync(extensionPath, { mode: 0o500 });
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: activePath, scheme: 'file', toString: () => `file://${activePath}` }, fileName: activePath, getText: () => 'text' },
+    }, { extensionPath, logPath });
+    try {
+        harness.commands.get('kokoreader.readFile')();
+        harness.spawned[0].child.emit('exit', 1);
+        assert(fs.existsSync(path.join(logPath, 'err.jsonl')), 'unwritable extension directory did not use fallback logging');
+    } finally {
+        harness.extension.deactivate();
+        fs.chmodSync(extensionPath, 0o700);
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+run('debug stderr does not replace playback progress in the status bar', () => {
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: '/tmp/kokoreader-debug.md', scheme: 'file', toString: () => 'file:///tmp/kokoreader-debug.md' }, fileName: '/tmp/kokoreader-debug.md', getText: () => 'text' },
+    }, { configuration: { debug: true } });
+    try {
+        harness.commands.get('kokoreader.readFile')();
+        const child = harness.spawned[0].child;
+        child.stderr.emit('data', Buffer.from('\r[1/2] preparing...'));
+        const progress = harness.statusItems[0].text;
+        child.stderr.emit('data', Buffer.from('worker diagnostic detail\n'));
+        assert(harness.statusItems[0].text === progress, `debug stderr replaced progress: ${harness.statusItems[0].text}`);
+    } finally {
+        harness.extension.deactivate();
+    }
 });
 
 run('relative model paths from a config file resolve against the install directory', () => {
@@ -662,8 +806,18 @@ run('block quotes and task lists receive structural speech markers', () => {
     fs.rmSync(paths.dir, { recursive: true, force: true });
     assert(JSON.stringify(prepared) === JSON.stringify([
         'Quote. Quoted text.',
-        'Unchecked item. Draft task.\nChecked item. Finished task.\nItem. Plain item.\nItem 1. Numbered item.',
+        'Unchecked item. Draft task.\nChecked item. Finished task.\n... Plain item.\nItem 1. Numbered item.',
     ]), `prepared text: ${JSON.stringify(prepared)}`);
+});
+
+run('unordered list markers become a short pause while ordered lists retain numbering', () => {
+    const paths = stubs({ text: '- Alpha\n1. Beta\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths) },
+    });
+    const prepared = stubEvents(paths).find(event => event.action === 'prepare');
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(prepared.text === '... Alpha\nItem 1. Beta', `prepared text: ${JSON.stringify(prepared.text)}`);
 });
 
 run('nested task lists inside block quotes retain both speech markers', () => {
@@ -698,7 +852,8 @@ run('supported voice languages localize inserted Markdown speech labels', () => 
         });
         const prepared = stubEvents(technical).filter(event => event.action === 'prepare').map(event => event.text);
         fs.rmSync(technical.dir, { recursive: true, force: true });
-        assert(JSON.stringify(prepared) === JSON.stringify(labels.slice(0, 5)), `${lang} technical labels: ${JSON.stringify(prepared)}`);
+        assert(JSON.stringify(prepared.slice(0, 4)) === JSON.stringify(labels.slice(0, 4)), `${lang} technical labels: ${JSON.stringify(prepared)}`);
+        assert(prepared[4].includes('\n... p.') && !prepared[4].includes('\nItem. p.'), `${lang} unordered-list pause: ${JSON.stringify(prepared[4])}`);
 
         const narrative = stubs({ text: '```text\nx\n```\n' });
         spawnSync(process.execPath, [CLI, ...cliArgs(narrative), '--lang', lang, '--profile', 'narrative', '--output', path.join(narrative.dir, 'o.wav'), narrative.input], {
@@ -892,6 +1047,92 @@ run('worker prepares source text before synthesizing every safe unit', () => {
         'prepared units were not synthesized in order');
 });
 
+run('CRLF paragraphs, nested inline tokens, and matched tilde fences are normalized', () => {
+    const paths = stubs({ text: 'Before.\r\n\r\n~~~js\r\nconst `name` = nmnm.jsonc;\r\n~~~\r\n\r\nAfter.\r' });
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], { env: { ...process.env, ...stubEnv(paths) } });
+    const prepared = stubEvents(paths).filter(event => event.action === 'prepare').map(event => event.text);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status === 0, result.stderr);
+    assert(JSON.stringify(prepared) === JSON.stringify(['Before.', 'The code is .. const `name` = nmnm dot jsonc;', 'After.']), JSON.stringify(prepared));
+});
+
+run('unclosed tilde fences remain literal source text', () => {
+    const paths = stubs({ text: '~~~\nnot closed\n' });
+    spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], { env: { ...process.env, ...stubEnv(paths) } });
+    const prepared = stubEvents(paths).find(event => event.action === 'prepare');
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(prepared.text.includes('~~~'), JSON.stringify(prepared));
+});
+
+run('worker requests time out and name their action', () => {
+    const source = fs.readFileSync(CLI, 'utf8');
+    assert(source.includes('WORKER_TIMEOUT_MS = 120000'), 'worker timeout constant missing');
+    assert(source.includes('${message.action} timed out after 120 seconds'), 'worker timeout does not name the request action');
+});
+
+run('worker does not send requests until model startup reports ready', () => {
+    const paths = stubs();
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_READY_DELAY: '300' },
+    });
+    const events = stubEvents(paths);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    const ready = events.find(event => event.tool === 'worker-ready');
+    const prepare = events.find(event => event.action === 'prepare');
+    assert(result.status === 0, result.stderr);
+    assert(ready && prepare && prepare.at >= ready.at, `request preceded worker readiness: ${JSON.stringify(events)}`);
+});
+
+run('threads and pronunciation options validate and extension forwards them', () => {
+    const invalid = cli(['--threads', '-1']);
+    const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    assert(invalid.status !== 0 && invalid.stderr.includes('threads must be a non-negative integer'), invalid.stderr);
+    assert(source.includes("add('--threads', 'threads')") && source.includes("add('--pronunciations', 'pronunciationsPath')"), 'extension config forwarding missing');
+    assert(manifest.contributes.configuration.properties['kokoreader.threads'], 'threads setting missing');
+    assert(manifest.contributes.configuration.properties['kokoreader.pronunciationsPath'], 'pronunciations setting missing');
+});
+
+run('pronunciations apply before markdown and use longest whole literal match', () => {
+    const paths = stubs({ text: '`nmnm.jsonc` nmnm.jsonc nmnm.jsoncx\n' });
+    const dictionary = path.join(paths.dir, 'pronunciations.json');
+    fs.writeFileSync(dictionary, JSON.stringify({ 'nmnm': 'short', 'nmnm.jsonc': 'long phrase' }));
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--pronunciations', dictionary, '--output', path.join(paths.dir, 'o.wav'), paths.input], { env: { ...process.env, ...stubEnv(paths) } });
+    const prepared = stubEvents(paths).find(event => event.action === 'prepare');
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status === 0, result.stderr);
+    assert(prepared.text.includes('long phrase long phrase nmnm.jsoncx'), prepared.text);
+});
+
+run('pronunciation replacements do not cascade into later dictionary keys', () => {
+    const paths = stubs({ text: 'foo bar\n' });
+    const dictionary = path.join(paths.dir, 'pronunciations.json');
+    fs.writeFileSync(dictionary, JSON.stringify({ foo: 'bar', bar: 'baz' }));
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--pronunciations', dictionary, '--output', path.join(paths.dir, 'o.wav'), paths.input], { env: { ...process.env, ...stubEnv(paths) } });
+    const prepared = stubEvents(paths).find(event => event.action === 'prepare');
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status === 0, result.stderr);
+    assert(prepared.text === 'bar baz', `replacement cascaded: ${prepared.text}`);
+});
+
+run('invalid pronunciation dictionaries fail before worker startup', () => {
+    const paths = stubs();
+    const dictionary = path.join(paths.dir, 'pronunciations.json');
+    fs.writeFileSync(dictionary, JSON.stringify({ '': 'bad' }));
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--pronunciations', dictionary, paths.input], { env: { ...process.env, ...stubEnv(paths) } });
+    const started = stubEvents(paths).some(event => event.tool === 'worker');
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status !== 0 && result.stderr.includes('pronunciations'), result.stderr);
+    assert(!started, 'worker started before dictionary validation');
+});
+
+run('extension manifest exposes paragraph navigation without default bindings', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    const commands = manifest.contributes.commands.map(command => command.command);
+    for (const command of ['kokoreader.previousParagraph', 'kokoreader.replayParagraph', 'kokoreader.nextParagraph']) assert(commands.includes(command), command);
+    assert(!manifest.contributes.keybindings, 'navigation must not add default keybindings');
+});
+
 run('live playback synthesizes the next unit before the current player exits', () => {
     const paths = stubs({ text: 'First.\n\nSecond.\n' });
     const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
@@ -911,6 +1152,133 @@ run('live playback synthesizes the next unit before the current player exits', (
         const firstExit = events.find(event => event.tool === 'ffplay-exit' && event.pid === firstPlay.pid);
         const syntheses = events.filter(event => event.action === 'synthesize');
         assert(syntheses[1].at < firstExit.at, 'second unit was not synthesized while first unit played');
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('navigation during synthesis replaces the worker and plays only the selected paragraph', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n\nThird.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '80' },
+    });
+    child.stderr.resume();
+    try {
+        assert(waitFor(() => stubEvents(paths).some(event => event.action === 'prepare')), 'first paragraph was not prepared');
+        child.stdin.write('next\n');
+        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'worker').length >= 2), 'navigation did not replace the worker');
+        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'ffplay').length >= 1), 'selected paragraph did not play');
+        const events = stubEvents(paths);
+        assert(!events.some(event => event.action === 'synthesize' && event.phonemes === 'First.'), `stale paragraph was synthesized: ${JSON.stringify(events)}`);
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('navigation during the source paragraph gap cancels it and starts the newest target promptly', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n\nThird.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_FFPLAY_HOLD_MS: '80' },
+    });
+    child.stderr.resume();
+    try {
+        const firstExit = waitFor(() => stubEvents(paths).find(event => event.tool === 'ffplay-exit'));
+        assert(firstExit, 'first paragraph did not finish');
+        const started = Date.now();
+        child.stdin.write('next\n');
+        assert(waitFor(() => stubEvents(paths).some(event => event.action === 'synthesize' && event.phonemes === 'Third.'), 600),
+            `newest paragraph did not begin promptly: ${JSON.stringify(stubEvents(paths))}`);
+        assert(Date.now() - started < 600, 'navigation waited for the 800 ms paragraph gap');
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('previous during synthesis plays only the preceding paragraph', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n\nThird.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), '--start-para', '2', paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '1000' },
+    });
+    child.stderr.resume();
+    try {
+        assert(waitFor(() => stubEvents(paths).some(event => event.action === 'prepare' && event.text === 'Second.')),
+            'starting paragraph was not prepared');
+        child.stdin.write('previous\n');
+        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'worker').length >= 2), 'previous did not replace the worker');
+        assert(waitFor(() => stubEvents(paths).some(event => event.action === 'synthesize' && event.phonemes === 'First.')),
+            'previous paragraph was not synthesized');
+        assert(!stubEvents(paths).some(event => event.action === 'synthesize' && event.phonemes === 'Second.'),
+            `stale paragraph was synthesized: ${JSON.stringify(stubEvents(paths))}`);
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('replay during playback restarts only the current paragraph', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const probe = String.raw`
+const { spawn } = require('child_process');
+const fs = require('fs');
+const cli = process.argv[1]; const paths = JSON.parse(process.argv[2]);
+const events = () => fs.existsSync(paths.events) ? fs.readFileSync(paths.events, 'utf8').split('\n').filter(Boolean).map(JSON.parse) : [];
+const wait = async check => { const end = Date.now() + 8000; while (!check()) { if (Date.now() > end) throw new Error(JSON.stringify(events())); await new Promise(resolve => setTimeout(resolve, 25)); } };
+(async () => {
+  const child = spawn(process.execPath, [cli, '--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices, paths.input], { stdio: ['pipe', 'ignore', 'ignore'] });
+  try {
+    await wait(() => events().some(event => event.tool === 'ffplay'));
+    await new Promise((resolve, reject) => child.stdin.write('replay\n', error => error ? reject(error) : resolve()));
+    await wait(() => events().filter(event => event.tool === 'worker').length >= 2);
+    await wait(() => events().filter(event => event.tool === 'ffplay').length >= 2);
+    const replay = events().map((event, index) => ({ event, index })).filter(({ event }) => event.tool === 'worker')[1].index;
+    if (events().slice(replay + 1).some(event => event.action === 'synthesize' && event.phonemes === 'Second.')) throw new Error(JSON.stringify(events()));
+  } finally { child.kill(); }
+})().then(() => process.exit(0), error => { console.error(error.message); process.exit(1); });
+`;
+    try {
+        const result = spawnSync(process.execPath, ['-e', probe, CLI, JSON.stringify(paths)], {
+            env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '5000' }, encoding: 'utf8', timeout: 12000,
+        });
+        assert(result.status === 0, `replay failed: ${result.stderr}`);
+    } finally {
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('navigation from pause keeps playback withheld until resume', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), '--start-para', '2', paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '80' },
+    });
+    child.stderr.resume();
+    try {
+        assert(waitFor(() => stubEvents(paths).some(event => event.action === 'prepare' && event.text === 'Second.')),
+            'starting paragraph was not prepared');
+        child.stdin.write('pause\nprevious\n');
+        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'worker').length >= 2), 'navigation did not replace the worker while paused');
+        sleepSync(500);
+        assert(!stubEvents(paths).some(event => event.tool === 'ffplay'), 'paused navigation started playback');
+        child.stdin.write('resume\n');
+        assert(waitFor(() => stubEvents(paths).some(event => event.tool === 'ffplay')), 'resume did not play the selected paragraph');
+        assert(stubEvents(paths).some(event => event.action === 'synthesize' && event.phonemes === 'First.'), 'previous paragraph was not selected');
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('failed lookahead prevents or stops active playback immediately', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_FAIL_PHONEMES: 'Second.', KKR_STUB_SYNTH_DELAY: '80', KKR_STUB_FFPLAY_HOLD: '1' },
+    });
+    child.stderr.resume();
+    try {
+        const first = waitFor(() => stubEvents(paths).find(event => event.tool === 'ffplay'), 1000);
+        if (first) assert(waitFor(() => !isAlive(first.pid) || null), `lookahead failure left active playback running: ${JSON.stringify(stubEvents(paths))}`);
     } finally {
         child.kill();
         fs.rmSync(paths.dir, { recursive: true, force: true });

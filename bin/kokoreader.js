@@ -35,15 +35,18 @@ const DEFAULTS = {
     MODEL_PRECISION: 'fp32',
     VOICE: 'af_heart', LANG: 'en-us', PROFILE: 'technical', SPEED: 1, TEMPO: 1, GAIN: -1,
     VOLUME: 1, FORMAT: 'wav', SAMPLE_RATE: 0, NORMALIZE: false, LIMITER: true,
-    OUTPUT_FILE: '', START_PARA: 0, DEBUG: false, FORCE: false,
+    THREADS: 0, PRONUNCIATIONS_PATH: '', OUTPUT_FILE: '', START_PARA: 0, DEBUG: false, FORCE: false,
 };
 const VOICE_LANGS = Object.freeze({
     a: 'en-us', b: 'en-gb', e: 'es', f: 'fr-fr', h: 'hi',
     i: 'it', j: 'ja', p: 'pt-br', z: 'cmn',
 });
+const WORKER_TIMEOUT_MS = 120000;
+const WORKER_SHUTDOWN_MS = 1500;
+const WORKER_STARTUP_TIMEOUT_MS = 20000;
 
 const INSTALL_DIR = path.join(__dirname, '..');
-const PATH_CONFIG_KEYS = new Set(['MODEL_DIR', 'MODEL_PATH', 'VOICES_PATH']);
+const PATH_CONFIG_KEYS = new Set(['MODEL_DIR', 'MODEL_PATH', 'VOICES_PATH', 'PRONUNCIATIONS_PATH']);
 // Model and playback settings only: a config file must not quietly change what a
 // single run does, or every editor read would overwrite the same output file.
 const IGNORED_CONFIG_KEYS = new Set(['OUTPUT_FILE', 'START_PARA', 'DEBUG', 'FORCE']);
@@ -81,6 +84,8 @@ function usage() {
 `  -l, --lang CODE            Language code (default: en-us)\n` +
 `  -p, --profile NAME         narrative or technical (default: technical)\n` +
 `  -s, --speed N              Kokoro synthesis speed 0.5-2.0 (default: 1)\n\n` +
+`  --threads N                ONNX Runtime thread cap; 0 selects automatically\n` +
+`  --pronunciations FILE      Local JSON source-phrase replacements\n\n` +
 `Playback:\n` +
 `  -t, --tempo N              Pitch-preserving playback speed (default: 1)\n` +
 `  -g, --gain DB              ffmpeg gain in dB (default: -1)\n` +
@@ -122,6 +127,8 @@ function parseArgs(argv, cfg) {
             case '-l': case '--lang': cfg.LANG = value(); explicitLanguage = true; break;
             case '-p': case '--profile': cfg.PROFILE = value().toLowerCase(); break;
             case '-s': case '--speed': cfg.SPEED = Number(value()); break;
+            case '--threads': cfg.THREADS = Number(value()); break;
+            case '--pronunciations': cfg.PRONUNCIATIONS_PATH = value(); break;
             case '-t': case '--tempo': cfg.TEMPO = Number(value()); break;
             case '-g': case '--gain': cfg.GAIN = Number(value()); break;
             case '-vol': case '--volume': cfg.VOLUME = Number(value()); break;
@@ -152,6 +159,7 @@ function parseArgs(argv, cfg) {
     if (!Number.isFinite(cfg.TEMPO) || cfg.TEMPO < 0.5 || cfg.TEMPO > 100) throw new Error('tempo must be between 0.5 and 100');
     if (!Number.isInteger(cfg.START_PARA) || cfg.START_PARA < 0) throw new Error('start-para must be a non-negative integer');
     if (!Number.isInteger(cfg.SAMPLE_RATE) || cfg.SAMPLE_RATE < 0) throw new Error('sample-rate must be a non-negative integer');
+    if (!Number.isInteger(cfg.THREADS) || cfg.THREADS < 0) throw new Error('threads must be a non-negative integer');
     if (!['wav', 'mp3', 'flac', 'opus'].includes(cfg.FORMAT)) throw new Error('format must be wav, mp3, flac, or opus');
     if (!Object.hasOwn(MODEL_FILES, cfg.MODEL_PRECISION)) throw new Error('model-precision must be fp32, fp16, or int8');
     if (cfg.FORCE && action !== 'download') throw new Error('--force requires --download');
@@ -180,6 +188,29 @@ function normalizeTechnicalTokens(text) {
         .replace(/[ \t]+/g, ' ').trim();
 }
 
+function loadPronunciations(file) {
+    if (!file) return null;
+    let dictionary;
+    try { dictionary = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch (error) { throw new Error(`pronunciations: cannot read valid JSON from ${file}: ${error.message}`); }
+    if (!dictionary || Array.isArray(dictionary) || typeof dictionary !== 'object') throw new Error('pronunciations: expected a JSON object');
+    const entries = Object.entries(dictionary);
+    if (!entries.every(([key, value]) => typeof key === 'string' && key && typeof value === 'string' && value)) {
+        throw new Error('pronunciations: keys and values must be nonempty strings');
+    }
+    entries.sort(([a], [b]) => b.length - a.length);
+    const escaped = entries.map(([phrase]) => phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    return {
+        matcher: new RegExp(`(?<![\\p{L}\\p{N}_.-])(?:${escaped.join('|')})(?![\\p{L}\\p{N}_.-])`, 'gu'),
+        replacements: new Map(entries),
+    };
+}
+
+function applyPronunciations(text, dictionary) {
+    if (!dictionary) return text;
+    return text.replace(dictionary.matcher, phrase => dictionary.replacements.get(phrase));
+}
+
 function normalizeCurrencies(text) {
     const names = { '$': 'dollars', '€': 'euros', '£': 'pounds', '¥': 'yen' };
     return text.replace(/([$€£¥])(\d+)\.(\d+)/g, (_, symbol, whole, fraction) =>
@@ -191,15 +222,15 @@ function normalizeDecimalPoints(text) {
 }
 
 const SPEECH_LABELS = Object.freeze({
-    'en-us': { code: 'The code is - ', codeBlock: 'A code block follows. You can see the code in the document.', table: 'Table.', columns: 'Columns:', row: n => `Row ${n}.`, column: n => `Column ${n}`, blank: 'blank', quote: 'Quote.', checked: 'Checked item.', unchecked: 'Unchecked item.', item: 'Item.', numbered: n => `Item ${n}.` },
-    'en-gb': { code: 'The code is - ', codeBlock: 'A code block follows. You can see the code in the document.', table: 'Table.', columns: 'Columns:', row: n => `Row ${n}.`, column: n => `Column ${n}`, blank: 'blank', quote: 'Quote.', checked: 'Checked item.', unchecked: 'Unchecked item.', item: 'Item.', numbered: n => `Item ${n}.` },
-    es: { code: 'El código es. ', codeBlock: 'Sigue un bloque de código. Puedes ver el código en el documento.', table: 'Tabla.', columns: 'Columnas:', row: n => `Fila ${n}.`, column: n => `Columna ${n}`, blank: 'vacío', quote: 'Cita.', checked: 'Elemento marcado.', unchecked: 'Elemento sin marcar.', item: 'Elemento.', numbered: n => `Elemento ${n}.` },
-    'fr-fr': { code: 'Le code est. ', codeBlock: 'Un bloc de code suit. Vous pouvez voir le code dans le document.', table: 'Tableau.', columns: 'Colonnes:', row: n => `Ligne ${n}.`, column: n => `Colonne ${n}`, blank: 'vide', quote: 'Citation.', checked: 'Élément coché.', unchecked: 'Élément non coché.', item: 'Élément.', numbered: n => `Élément ${n}.` },
-    hi: { code: 'कोड है। ', codeBlock: 'आगे एक कोड ब्लॉक है। आप दस्तावेज़ में कोड देख सकते हैं।', table: 'तालिका।', columns: 'स्तंभ:', row: n => `पंक्ति ${n}.`, column: n => `स्तंभ ${n}`, blank: 'खाली', quote: 'उद्धरण।', checked: 'चेक किया गया आइटम।', unchecked: 'अनचेक किया गया आइटम।', item: 'आइटम।', numbered: n => `आइटम ${n}.` },
-    it: { code: 'Il codice è. ', codeBlock: 'Segue un blocco di codice. Puoi vedere il codice nel documento.', table: 'Tabella.', columns: 'Colonne:', row: n => `Riga ${n}.`, column: n => `Colonna ${n}`, blank: 'vuoto', quote: 'Citazione.', checked: 'Elemento selezionato.', unchecked: 'Elemento non selezionato.', item: 'Elemento.', numbered: n => `Elemento ${n}.` },
-    ja: { code: 'コードです。 ', codeBlock: 'コードブロックが続きます。ドキュメントでコードを確認できます。', table: '表。', columns: '列:', row: n => `行 ${n}。`, column: n => `列 ${n}`, blank: '空欄', quote: '引用。', checked: 'チェック済みの項目。', unchecked: '未チェックの項目。', item: '項目。', numbered: n => `項目 ${n}。` },
-    'pt-br': { code: 'O código é. ', codeBlock: 'Segue um bloco de código. Você pode ver o código no documento.', table: 'Tabela.', columns: 'Colunas:', row: n => `Linha ${n}.`, column: n => `Coluna ${n}`, blank: 'em branco', quote: 'Citação.', checked: 'Item marcado.', unchecked: 'Item não marcado.', item: 'Item.', numbered: n => `Item ${n}.` },
-    cmn: { code: '代码是。 ', codeBlock: '接下来是代码块。您可以在文档中查看代码。', table: '表格。', columns: '列：', row: n => `第 ${n} 行。`, column: n => `第 ${n} 列`, blank: '空白', quote: '引用。', checked: '已选中项目。', unchecked: '未选中项目。', item: '项目。', numbered: n => `项目 ${n}。` },
+    'en-us': { code: 'The code is - ', codeBlock: 'A code block follows. You can see the code in the document.', table: 'Table.', columns: 'Columns:', row: n => `Row ${n}.`, column: n => `Column ${n}`, blank: 'blank', quote: 'Quote.', checked: 'Checked item.', unchecked: 'Unchecked item.', numbered: n => `Item ${n}.` },
+    'en-gb': { code: 'The code is - ', codeBlock: 'A code block follows. You can see the code in the document.', table: 'Table.', columns: 'Columns:', row: n => `Row ${n}.`, column: n => `Column ${n}`, blank: 'blank', quote: 'Quote.', checked: 'Checked item.', unchecked: 'Unchecked item.', numbered: n => `Item ${n}.` },
+    es: { code: 'El código es. ', codeBlock: 'Sigue un bloque de código. Puedes ver el código en el documento.', table: 'Tabla.', columns: 'Columnas:', row: n => `Fila ${n}.`, column: n => `Columna ${n}`, blank: 'vacío', quote: 'Cita.', checked: 'Elemento marcado.', unchecked: 'Elemento sin marcar.', numbered: n => `Elemento ${n}.` },
+    'fr-fr': { code: 'Le code est. ', codeBlock: 'Un bloc de code suit. Vous pouvez voir le code dans le document.', table: 'Tableau.', columns: 'Colonnes:', row: n => `Ligne ${n}.`, column: n => `Colonne ${n}`, blank: 'vide', quote: 'Citation.', checked: 'Élément coché.', unchecked: 'Élément non coché.', numbered: n => `Élément ${n}.` },
+    hi: { code: 'कोड है। ', codeBlock: 'आगे एक कोड ब्लॉक है। आप दस्तावेज़ में कोड देख सकते हैं।', table: 'तालिका।', columns: 'स्तंभ:', row: n => `पंक्ति ${n}.`, column: n => `स्तंभ ${n}`, blank: 'खाली', quote: 'उद्धरण।', checked: 'चेक किया गया आइटम।', unchecked: 'अनचेक किया गया आइटम।', numbered: n => `आइटम ${n}.` },
+    it: { code: 'Il codice è. ', codeBlock: 'Segue un blocco di codice. Puoi vedere il codice nel documento.', table: 'Tabella.', columns: 'Colonne:', row: n => `Riga ${n}.`, column: n => `Colonna ${n}`, blank: 'vuoto', quote: 'Citazione.', checked: 'Elemento selezionato.', unchecked: 'Elemento non selezionato.', numbered: n => `Elemento ${n}.` },
+    ja: { code: 'コードです。 ', codeBlock: 'コードブロックが続きます。ドキュメントでコードを確認できます。', table: '表。', columns: '列:', row: n => `行 ${n}。`, column: n => `列 ${n}`, blank: '空欄', quote: '引用。', checked: 'チェック済みの項目。', unchecked: '未チェックの項目。', numbered: n => `項目 ${n}。` },
+    'pt-br': { code: 'O código é. ', codeBlock: 'Segue um bloco de código. Você pode ver o código no documento.', table: 'Tabela.', columns: 'Colunas:', row: n => `Linha ${n}.`, column: n => `Coluna ${n}`, blank: 'em branco', quote: 'Citação.', checked: 'Item marcado.', unchecked: 'Item não marcado.', numbered: n => `Item ${n}.` },
+    cmn: { code: '代码是。 ', codeBlock: '接下来是代码块。您可以在文档中查看代码。', table: '表格。', columns: '列：', row: n => `第 ${n} 行。`, column: n => `第 ${n} 列`, blank: '空白', quote: '引用。', checked: '已选中项目。', unchecked: '未选中项目。', numbered: n => `项目 ${n}。` },
 });
 
 function speechLabels(lang) {
@@ -261,35 +292,35 @@ function normalizeMarkdownStructure(text, cfg) {
         }
         content = content.replace(/^[ \t]*[-*+]\s+\[([ xX])\]\s+/, (_, marked) =>
             /x/i.test(marked) ? `${speech.checked} ` : `${speech.unchecked} `)
-            .replace(/^[ \t]*[-*+]\s+/, `${speech.item} `)
+            .replace(/^[ \t]*[-*+]\s+/, '... ')
             .replace(/^[ \t]*(\d+)[.)]\s+/, (_, number) => `${speech.numbered(number)} `);
         return `${`${speech.quote} `.repeat(quotes)}${content}`;
     }).join('\n');
 }
 
 function stripMarkdown(text, cfg) {
+    text = applyPronunciations(text.replace(/\r\n?/g, '\n'), cfg.PRONUNCIATIONS);
     const speech = speechLabels(cfg.LANG);
+    const blocks = [];
+    const protectedBlocks = text.replace(/^(?<fence>`{3}|~{3})[^\n]*\n([\s\S]*?)^\k<fence>[ \t]*$/gm, (_, fence, code) => {
+        const token = `\uE100${blocks.length}\uE101`;
+        blocks.push(cfg.PROFILE === 'technical' ? `\n\n${speech.code}${normalizeTechnicalTokens(code)}\n\n` : `\n\n${speech.codeBlock}\n\n`);
+        return token;
+    });
     const inline = [];
-    const protectedInline = text.replace(/`([^`\n]+)`/g, (_, code) => {
+    const protectedInline = protectedBlocks.replace(/`([^`\n]+)`/g, (_, code) => {
         const token = `\uE000${inline.length}\uE001`;
         inline.push(normalizeTechnicalTokens(code));
         return token;
     });
-    const blocks = [];
-    const protectedBlocks = protectedInline.replace(/^```[^\n]*\n([\s\S]*?)^```\s*$/gm, (_, code) => {
-        const token = `\uE100${blocks.length}\uE101`;
-        blocks.push(cfg.PROFILE === 'technical' ? `\n\n${speech.code}${normalizeTechnicalTokens(code)}\n\n` :
-            `\n\n${speech.codeBlock}\n\n`);
-        return token;
-    });
-    const markdown = normalizeMarkdownStructure(normalizeMarkdownTables(protectedBlocks, cfg), cfg)
+    const markdown = normalizeMarkdownStructure(normalizeMarkdownTables(protectedInline, cfg), cfg)
         .replace(/`([^`]*)`/g, '$1').replace(/^[ \t]*#+[ \t]*/gm, '')
         .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
         .replace(/<\/?[a-zA-Z!][^>]*>/g, '').replace(/\*\*([^*]*)\*\*/g, '$1')
         .replace(/__([^_]*)__/g, '$1').replace(/\*([^*]*)\*/g, '$1')
         .replace(/^[ \t]*[-*=]{3,}[ \t]*$/gm, '').replace(/\n{3,}/g, '\n\n')
-        .replace(/\uE000(\d+)\uE001/g, (_, index) => inline[Number(index)])
-        .replace(/\uE100(\d+)\uE101/g, (_, index) => blocks[Number(index)]);
+        .replace(/\uE100(\d+)\uE101/g, (_, index) => blocks[Number(index)])
+        .replace(/\uE000(\d+)\uE001/g, (_, index) => inline[Number(index)]);
     return normalizeDecimalPoints(normalizeCurrencies(markdown));
 }
 
@@ -310,42 +341,84 @@ class Worker {
     constructor(cfg) {
         const { model, voices } = requireAssets(cfg);
         const python = cfg.PYTHON_PATH || process.env.KOKORO_READER_PYTHON || 'python3';
-        this.proc = spawn(python, [path.join(__dirname, '..', 'python', 'kokoro_worker.py'), '--serve', '--model', model, '--voices', voices], {
+        const args = [path.join(__dirname, '..', 'python', 'kokoro_worker.py'), '--serve', '--model', model, '--voices', voices];
+        if (cfg.THREADS) args.push('--threads', String(cfg.THREADS));
+        this.proc = spawn(python, args, {
             stdio: ['pipe', 'pipe', 'pipe'],
         });
         this.pending = new Map();
         this.nextId = 1;
         this.exited = false;
+        this.closeTimer = null;
+        this.exitPromise = new Promise(resolve => { this.resolveExit = resolve; });
+        this.readyPending = true;
+        this.ready = new Promise((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject; });
+        this.readyTimeout = setTimeout(() => {
+            const error = new Error('Kokoro worker did not become ready within 20 seconds');
+            this.fail(error);
+            this.close();
+        }, WORKER_STARTUP_TIMEOUT_MS);
         readline.createInterface({ input: this.proc.stdout }).on('line', line => this.receive(line));
         this.proc.stderr.on('data', chunk => { if (cfg.DEBUG) process.stderr.write(chunk); });
-        this.proc.on('error', error => this.fail(error));
+        this.proc.on('error', error => {
+            this.fail(error);
+            this.finishExit();
+        });
         this.proc.on('exit', (code, signal) => {
             this.exited = true;
-            if (this.pending.size) this.fail(new Error(code === null ? `Kokoro worker exited from ${signal || 'a signal'}` : `Kokoro worker exited with code ${code}`));
+            this.finishExit();
+            this.fail(new Error(code === null ? `Kokoro worker exited from ${signal || 'a signal'}` : `Kokoro worker exited with code ${code}`));
         });
     }
     receive(line) {
         let message;
         try { message = JSON.parse(line); } catch (_) { return; }
+        if (message.ready === true) {
+            if (this.readyPending) {
+                this.readyPending = false;
+                clearTimeout(this.readyTimeout);
+                this.resolveReady();
+            }
+            return;
+        }
         const pending = this.pending.get(message.id);
         if (!pending) return;
         this.pending.delete(message.id);
+        clearTimeout(pending.timeout);
         if (message.error) pending.reject(new Error(message.error)); else pending.resolve(message);
     }
-    fail(error) { for (const { reject } of this.pending.values()) reject(error); this.pending.clear(); }
+    fail(error) {
+        if (this.readyPending) {
+            this.readyPending = false;
+            clearTimeout(this.readyTimeout);
+            this.rejectReady(new Error(`Kokoro worker failed before startup completed: ${error.message}`));
+        }
+        for (const { reject, timeout } of this.pending.values()) { clearTimeout(timeout); reject(error); }
+        this.pending.clear();
+    }
     request(message) {
+        return this.ready.then(() => this.sendRequest(message));
+    }
+    sendRequest(message) {
         return new Promise((resolve, reject) => {
             if (this.exited || this.proc.stdin.destroyed || this.proc.stdin.writableEnded) return reject(new Error('Kokoro worker is not running'));
             const id = this.nextId++;
-            this.pending.set(id, { resolve, reject });
+            const timeout = setTimeout(() => {
+                if (!this.pending.delete(id)) return;
+                const error = new Error(`${message.action} timed out after 120 seconds`);
+                this.close();
+                reject(error);
+            }, WORKER_TIMEOUT_MS);
+            this.pending.set(id, { resolve, reject, timeout });
             try {
                 this.proc.stdin.write(JSON.stringify({ id, ...message }) + '\n', error => {
                     if (!error || !this.pending.has(id)) return;
-                    this.pending.delete(id);
+                    clearTimeout(this.pending.get(id).timeout); this.pending.delete(id);
                     reject(error);
                 });
             } catch (error) {
                 this.pending.delete(id);
+                clearTimeout(timeout);
                 reject(error);
             }
         });
@@ -365,7 +438,23 @@ class Worker {
     }
     async list() { return (await this.request({ action: 'list' })).voices; }
     async languages() { return this.request({ action: 'languages' }); }
-    close() { try { this.proc.kill(); } catch (_) {} }
+    finishExit() {
+        clearTimeout(this.readyTimeout);
+        if (this.closeTimer) clearTimeout(this.closeTimer);
+        this.closeTimer = null;
+        this.resolveExit();
+    }
+    close() {
+        if (!this.exited) {
+            try { this.proc.kill('SIGTERM'); } catch (_) {}
+            if (!this.closeTimer) {
+                this.closeTimer = setTimeout(() => {
+                    if (!this.exited) { try { this.proc.kill('SIGKILL'); } catch (_) {} }
+                }, WORKER_SHUTDOWN_MS);
+            }
+        }
+        return this.exitPromise;
+    }
 }
 
 // espeak-ng degrades a whole paragraph the same way, so one report per distinct
@@ -382,6 +471,8 @@ let activeFfplay = null;
 let activeWorker = null;
 let activePartFile = null;
 let playbackPaused = false;
+let liveController = null;
+let playbackCancelled = false;
 // The live paragraph's mute, and the callbacks a `resume` has to wake: paragraphs
 // withheld before they started.
 let activePause = null;
@@ -422,6 +513,7 @@ function setupIPC() {
     readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
         if (line.trim() === 'pause') pausePlayback();
         if (line.trim() === 'resume') resumePlayback();
+        if (['previous', 'replay', 'next'].includes(line.trim()) && liveController) liveController.navigate(line.trim());
         if (line.trim() === 'stop') { killActive(); process.exit(0); }
     });
 }
@@ -454,6 +546,9 @@ function playSegment(pcm, offset, sampleRate, cfg) {
     return new Promise((resolve, reject) => {
         const ffmpeg = activeFfmpeg = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg), '-f', 'wav', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
         const ffplay = activeFfplay = spawn('ffplay', ['-nodisp', '-autoexit', '-f', 'wav', '-i', 'pipe:0'], { stdio: ['pipe', 'ignore', 'ignore'] });
+        for (const child of [ffmpeg, ffplay]) child.once('spawn', () => {
+            if (playbackCancelled) { try { child.kill(); } catch (_) {} }
+        });
         const started = Date.now();
         // A child that dies mid-stream makes its pipes emit EPIPE/ERR_STREAM_DESTROYED.
         // The 'exit' handlers already report the failure; this only stops an unhandled
@@ -482,8 +577,8 @@ function playSegment(pcm, offset, sampleRate, cfg) {
         ffmpeg.stdout.pipe(ffplay.stdin);
         ffmpeg.on('error', error => settle(0, error));
         ffplay.on('error', error => settle(0, error));
-        ffmpeg.on('exit', code => { ffmpegDone = true; if (code !== 0) settle(0, new Error(`ffmpeg exited with code ${code}`)); else if (ffplayDone) settle(pcm.length); });
-        ffplay.on('exit', code => { ffplayDone = true; if (code !== 0) settle(0, new Error(`ffplay exited with code ${code}`)); else if (ffmpegDone) settle(pcm.length); });
+        ffmpeg.on('exit', code => { ffmpegDone = true; if (playbackCancelled) settle(pcm.length); else if (code !== 0) settle(0, new Error(`ffmpeg exited with code ${code}`)); else if (ffplayDone) settle(pcm.length); });
+        ffplay.on('exit', code => { ffplayDone = true; if (playbackCancelled) settle(pcm.length); else if (code !== 0) settle(0, new Error(`ffplay exited with code ${code}`)); else if (ffmpegDone) settle(pcm.length); });
         activePause = pause;
     });
 }
@@ -532,38 +627,124 @@ async function* preparedUnits(text, cfg, worker) {
     }
 }
 
-async function playPreparedUnits(units, worker, cfg) {
-    const iterator = units[Symbol.asyncIterator]();
-    let current = await iterator.next();
-    if (current.done) return;
-    let currentAudio = await worker.synthesize(current.value.phonemes, cfg);
-    while (!current.done) {
-        process.stderr.write(`\r[${current.value.paragraph}/${current.value.total}] playing...     `);
-        const playing = playPCM(currentAudio.pcm, currentAudio.sampleRate, cfg);
-        const lookahead = (async () => {
-            while (playbackPaused) await new Promise(wake => onResume.add(wake));
-            const next = await iterator.next();
-            if (next.done) return { next, audio: null };
-            return { next, audio: await worker.synthesize(next.value.phonemes, cfg) };
-        })();
-        await playing;
-        const { next, audio } = await lookahead;
-        if (next.done) break;
-        if (next.value.paragraph !== current.value.paragraph) await delay(PARAGRAPH_PAUSE_MS);
-        current = next;
-        currentAudio = audio;
+class PlaybackController {
+    constructor(text, worker, cfg) {
+        this.text = text; this.worker = worker; this.cfg = cfg;
+        this.index = Math.max(0, cfg.START_PARA - 1); this.generation = 0; this.prefetched = new Map(); this.fatal = null;
+        this.workerClosing = Promise.resolve(); this.cancelGap = null;
     }
+    cancelWorker() {
+        const worker = this.worker;
+        this.worker = null;
+        if (activeWorker === worker) activeWorker = null;
+        if (worker) this.workerClosing = Promise.race([
+            worker.close().catch(() => {}),
+            delay(WORKER_SHUTDOWN_MS + 100),
+        ]);
+        playbackCancelled = true;
+        if (this.cancelGap) this.cancelGap();
+        if (activePause) activePause();
+        for (const child of [activeFfmpeg, activeFfplay]) {
+            try { child?.kill(); } catch (_) {}
+        }
+    }
+    async ensureWorker(generation) {
+        await this.workerClosing;
+        if (generation !== undefined && generation !== this.generation) return null;
+        if (!this.worker) this.worker = activeWorker = new Worker(this.cfg);
+        return this.worker;
+    }
+    navigate(action) {
+        if (action === 'previous') this.index = Math.max(0, this.index - 1);
+        if (action === 'next') this.index = Math.min(this.text.length - 1, this.index + 1);
+        this.generation++;
+        this.prefetched.clear();
+        this.cancelWorker();
+    }
+    async prepareParagraph(paragraph, generation) {
+        if (this.prefetched.has(paragraph)) return this.prefetched.get(paragraph);
+        const promise = (async () => {
+            const worker = await this.ensureWorker(generation);
+            if (!worker) return null;
+            const units = await worker.prepare(this.text[paragraph], this.cfg);
+            if (generation !== this.generation) return null;
+            const audio = await worker.synthesize(units[0], this.cfg);
+            return { units, audio };
+        })().catch(error => {
+            if (generation === this.generation) {
+                this.fatal = error;
+                this.generation++;
+                this.cancelWorker();
+            }
+            throw error;
+        });
+        this.prefetched.set(paragraph, promise);
+        return promise;
+    }
+    async run() {
+        while (this.index < this.text.length) {
+            const generation = this.generation;
+            const paragraph = this.index;
+            process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] preparing...`);
+            let prepared;
+            try { prepared = await this.prepareParagraph(paragraph, generation); }
+            catch (error) { if (generation !== this.generation) continue; throw error; }
+            if (!prepared || generation !== this.generation) continue;
+            for (let unit = 0; unit < prepared.units.length; unit++) {
+                process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] synthesizing...`);
+                let audio;
+                try {
+                    const worker = unit === 0 ? null : await this.ensureWorker(generation);
+                    if (unit && !worker) break;
+                    audio = unit === 0 ? prepared.audio : await worker.synthesize(prepared.units[unit], this.cfg);
+                }
+                catch (error) { if (generation !== this.generation) break; throw error; }
+                if (generation !== this.generation) break;
+                process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] playing...     `);
+                const lookahead = unit === prepared.units.length - 1 && paragraph + 1 < this.text.length ?
+                    this.prepareParagraph(paragraph + 1, generation) : null;
+                if (lookahead) lookahead.catch(() => {});
+                await Promise.resolve();
+                if (this.fatal) throw this.fatal;
+                playbackCancelled = false;
+                await playPCM(audio.pcm, audio.sampleRate, this.cfg);
+                if (lookahead) {
+                    try { await lookahead; }
+                    catch (error) { if (generation === this.generation) throw error; }
+                }
+                if (generation !== this.generation) break;
+            }
+            if (generation !== this.generation) continue;
+            this.index++;
+            if (this.index < this.text.length) await this.waitForParagraphGap();
+        }
+    }
+    waitForParagraphGap() {
+        return new Promise(resolve => {
+            let done;
+            const timer = setTimeout(() => done(), PARAGRAPH_PAUSE_MS);
+            const cancel = () => { clearTimeout(timer); done(); };
+            done = () => {
+                if (this.cancelGap === cancel) this.cancelGap = null;
+                resolve();
+            };
+            this.cancelGap = cancel;
+        });
+    }
+    close() { this.cancelWorker(); }
 }
 
 async function read(inputFile, cfg) {
-    const raw = inputFile ? fs.readFileSync(inputFile, 'utf8') : await readStdin();
     if (inputFile) setupIPC();
-    const text = paragraphs(raw, cfg);
-    if (!text.length) throw new Error('Nothing to read.');
-    if (cfg.START_PARA > text.length) throw new Error(`start-para must be no greater than the number of paragraphs (${text.length})`);
-    const worker = activeWorker = new Worker(cfg);
+    let worker = null;
     let saver = null;
     try {
+        const raw = inputFile ? fs.readFileSync(inputFile, 'utf8') : await readStdin();
+        cfg.PRONUNCIATIONS = loadPronunciations(cfg.PRONUNCIATIONS_PATH);
+        const text = paragraphs(raw, cfg);
+        if (!text.length) throw new Error('Nothing to read.');
+        if (cfg.START_PARA > text.length) throw new Error(`start-para must be no greater than the number of paragraphs (${text.length})`);
+        worker = activeWorker = new Worker(cfg);
         const units = preparedUnits(text, cfg, worker);
         if (cfg.OUTPUT_FILE) {
             let previousParagraph = 0;
@@ -581,7 +762,8 @@ async function read(inputFile, cfg) {
                 previousParagraph = unit.paragraph;
             }
         } else {
-            await playPreparedUnits(units, worker, cfg);
+            liveController = new PlaybackController(text, worker, cfg);
+            await liveController.run();
         }
         if (saver) { saver.stdin.end(); await saver.done; }
         process.stderr.write('\n');
@@ -589,8 +771,9 @@ async function read(inputFile, cfg) {
         if (saver) saver.abort();
         throw error;
     } finally {
-        worker.close();
+        if (liveController) liveController.close(); else worker?.close();
         activeWorker = null;
+        liveController = null;
         if (inputFile) process.stdin.destroy();
     }
 }

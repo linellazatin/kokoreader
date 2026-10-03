@@ -5,7 +5,7 @@
   "icon": "images/openlines.png",
   "repository": { "type": "git", "url": "https://github.com/linellazatin/kokoreader" },
   "license": "MIT",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "openlines",
   "author": "Linel Lazatin",
   "engines": { "vscode": "^1.75.0" },
@@ -19,6 +19,9 @@
       { "command": "kokoreader.readFromCursor", "title": "Koko Read From Cursor" },
       { "command": "kokoreader.pause", "title": "Koko Pause" },
       { "command": "kokoreader.resume", "title": "Koko Resume" },
+      { "command": "kokoreader.previousParagraph", "title": "Koko Previous Paragraph" },
+      { "command": "kokoreader.replayParagraph", "title": "Koko Replay Paragraph" },
+      { "command": "kokoreader.nextParagraph", "title": "Koko Next Paragraph" },
       { "command": "kokoreader.stop", "title": "Koko Stop" },
       { "command": "kokoreader.saveFile", "title": "Koko Save to File" }
     ],
@@ -28,6 +31,9 @@
         { "command": "kokoreader.readFromCursor", "group": "navigation@2", "when": "!kokoreader.isPlaying && !kokoreader.isPaused && !kokoreader.isSaving" },
         { "command": "kokoreader.pause", "group": "navigation@3", "when": "kokoreader.isPlaying" },
         { "command": "kokoreader.resume", "group": "navigation@4", "when": "kokoreader.isPaused" },
+        { "command": "kokoreader.previousParagraph", "group": "navigation@4.1", "when": "kokoreader.isPlaying || kokoreader.isPaused" },
+        { "command": "kokoreader.replayParagraph", "group": "navigation@4.2", "when": "kokoreader.isPlaying || kokoreader.isPaused" },
+        { "command": "kokoreader.nextParagraph", "group": "navigation@4.3", "when": "kokoreader.isPlaying || kokoreader.isPaused" },
         { "command": "kokoreader.stop", "group": "navigation@5", "when": "kokoreader.isPlaying || kokoreader.isPaused || kokoreader.isSaving" },
         { "command": "kokoreader.saveFile", "group": "navigation@6", "when": "!kokoreader.isPlaying && !kokoreader.isPaused && !kokoreader.isSaving" }
       ]
@@ -51,7 +57,9 @@
         "kokoreader.sampleRate": { "type": "number", "order": 14, "minimum": 0, "default": 0, "description": "Saved-audio sample rate in Hz. Set 0 to preserve Kokoro's source rate." },
         "kokoreader.normalize": { "type": "boolean", "order": 15, "default": false, "description": "Apply EBU R128 loudness normalization." },
         "kokoreader.limiter": { "type": "boolean", "order": 16, "default": true, "description": "Limit output peaks to prevent clipping." },
-        "kokoreader.debug": { "type": "boolean", "order": 17, "default": false, "description": "Show Python worker errors for troubleshooting." }
+        "kokoreader.debug": { "type": "boolean", "order": 17, "default": false, "description": "Show worker errors without replacing playback progress." },
+        "kokoreader.threads": { "type": "number", "order": 18, "minimum": 0, "default": 0, "description": "ONNX Runtime thread cap. Set 0 for automatic selection." },
+        "kokoreader.pronunciationsPath": { "type": "string", "order": 19, "default": "", "description": "Local JSON object mapping literal source phrases to spoken replacements." }
       }
     }
   }

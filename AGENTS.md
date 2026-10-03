@@ -5,24 +5,24 @@
 Kokoreader reads text and Markdown aloud using local Kokoro inference. It provides:
 
 - A Node.js CLI for files and pipelines.
-- A VS Code/VSCodium extension for reading an editor selection, a whole tab, or from the cursor through the rest of a document.
+- A VS Code/VSCodium extension for reading an editor selection, whole tab, or text from the cursor onward.
 - Audio export in WAV, MP3, FLAC, or Opus formats.
 
-After one-time dependency and model downloads, synthesis runs locally without an account, API key, text upload, or cloud inference service.
+After one-time dependency and model downloads, synthesis runs locally without accounts, API keys, text uploads, or cloud inference.
 
-Long-document playback phonemizes text, splits it below Kokoro’s model boundary, and keeps an upcoming unit synthesized while the current unit plays. Source paragraphs retain an 800 ms gap in live playback and saved audio; safe internal splits do not add paragraph pauses.
+The reader phonemizes text before synthesis, splits long content below the model boundary, and synthesizes an upcoming unit while the current unit plays. Source paragraphs retain an 800 ms gap; safely split units within a paragraph do not receive additional pauses.
 
-Markdown structure is handled before speech: formatting, links, images, and HTML are removed. Block quotes are announced as “Quote.”, task items as “Checked item.” or “Unchecked item.”, and regular list items retain an item marker.
+Markdown processing removes formatting, links, images, and HTML before speech while retaining document structure such as announced block quotes.
 
 ## Commands
 
-The package exposes this test command:
+Run the test suite:
 
 ```sh
 npm test
 ```
 
-It runs:
+This executes:
 
 ```sh
 node test/cli.js
@@ -30,36 +30,40 @@ node test/cli.js
 
 ## Architecture
 
-The repository is organized around the CLI and editor extension, with local Kokoro inference and supporting research/configuration material:
+The repository includes both CLI and editor-extension functionality:
 
-- `bin/` — command-line implementation.
-- `extension/` — VS Code/VSCodium extension code.
-- `kkr-models/` — model-related assets.
-- `python/` — Python support code.
-- `images/` — image assets.
-- `config/` — configuration files.
-- `test/` — test runner and test files.
-- `research/`, `research_kokoro_bounds/`, `research_workflow_pinning/` — research and workflow material.
-- `.github/`, `.nanomneme/`, `.superpowers/` — repository support directories.
+- `extension/` contains the VS Code/VSCodium extension.
+- `test/` contains CLI tests.
+- `kkr-models/` contains model-related assets, including ONNX and binary files.
+- `python/` contains Python support code.
+- `config/` contains configuration files and sample configuration.
+- `bin/` contains executable/support scripts.
+- `research/`, `research_kokoro_bounds/`, and `research_workflow_pinning/` contain investigation and workflow material.
 
 ## Configuration and installation
 
-The project uses `package.json` for its Node.js package metadata and scripts. Local inference requires one-time dependency and model downloads, as described by the project documentation. Configuration-related files are under `config/`; inspect their contents before changing runtime behavior.
-
-## Testing and operational quirks
-
-Run `npm test` after changes affecting the CLI or shared behavior. The implementation is designed for long documents and must preserve Kokoro’s model-boundary handling and paragraph timing. Avoid adding pauses when a paragraph is internally split into multiple synthesis units.
+Kokoreader requires one-time dependency and model downloads before local inference can run. Inspect `README.md`, `config/`, and the extension configuration before changing installation or runtime behavior.
 
 Keep secrets and generated output out of tracked configuration.
 
+## Testing and operational quirks
+
+Long text handling is central to behavior:
+
+- The first synthesis unit targets an early sentence boundary within 200 phonemes to reduce time to first audio.
+- Later units use a 500-phoneme safety boundary.
+- Paragraph boundaries produce an 800 ms pause in live playback and saved audio.
+
+Run the narrowest relevant test before running the full suite, and inspect implementation files before changing CLI, Markdown, synthesis, or extension behavior.
+
 ## Key files
 
-- `README.md` — product behavior and user-facing feature description.
-- `package.json` — package metadata and commands.
-- `bin/` — CLI implementation.
-- `extension/` — editor integration.
-- `test/cli.js` — command invoked by the test script.
-- `config/` — runtime configuration area.
-- `kkr-models/` — model assets.
+- `README.md` — user-facing usage and feature documentation.
+- `package.json` — Node package scripts, including tests.
+- `test/cli.js` — CLI test entry point.
+- `extension/` — editor extension implementation.
+- `config/` — runtime configuration and sample configuration.
+- `kkr-models/` — local model assets.
+- `CHANGELOG.md` — release history.
 - `AGENTS.md` — repository-specific agent instructions.
-<!-- opl-init:fp c5a1e712ed5e40dc -->
+<!-- opl-init:fp e67408ad14955ca9 -->

@@ -14,6 +14,7 @@ let saveGeneration = 0;
 let statusItem = null;
 let paused = false;
 let activeTemporary = null;
+const ERROR_LOG_MAX_BYTES = 1024 * 1024;
 
 function setState(playing, isPaused) {
     vscode.commands.executeCommand('setContext', 'kokoreader.isPlaying', playing);
@@ -58,6 +59,7 @@ function configArgs(config) {
     add('--python-path', 'pythonPath'); add('--voice', 'voice'); add('--lang', 'lang');
     add('--profile', 'profile');
     add('--speed', 'speed'); add('--tempo', 'tempo'); add('--gain', 'gain'); add('--volume', 'volume');
+    add('--threads', 'threads'); add('--pronunciations', 'pronunciationsPath');
     add('--format', 'format'); add('--sample-rate', 'sampleRate');
     addBool('--normalize', '--no-normalize', 'normalize'); addBool('--limiter', '--no-limiter', 'limiter');
     if (config.get('debug')) args.push('--debug');
@@ -107,6 +109,24 @@ function updateStatus(text) {
     if (statusItem && text) statusItem.text = `$(sync~spin) ${text}  $(primitive-square)`;
 }
 
+function appendErrorLog(context, entry) {
+    const line = JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n';
+    const files = [path.join(context.extensionPath, 'logs', 'err.jsonl')];
+    if (context.logUri && context.logUri.fsPath) files.push(path.join(context.logUri.fsPath, 'err.jsonl'));
+    for (const file of files) {
+        try {
+            fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+            if (fs.existsSync(file) && fs.statSync(file).size >= ERROR_LOG_MAX_BYTES) {
+                const archived = `${file}.1`;
+                try { fs.unlinkSync(archived); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+                fs.renameSync(file, archived);
+            }
+            fs.appendFileSync(file, line, { encoding: 'utf8', mode: 0o600 });
+            return;
+        } catch (_) {}
+    }
+}
+
 function activate(context) {
     statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
     statusItem.command = 'kokoreader.stop';
@@ -117,10 +137,13 @@ function activate(context) {
     function startReading(config, file, status, temporary = null) {
         updateStatus(status);
         const proc = spawnCli([...configArgs(config), file], { stdio: ['pipe', 'ignore', 'pipe'] });
-        let lastLine = '';
+        let lastError = '';
         const note = chunk => {
-            const lines = chunk.toString().replace(/\r/g, '\n').trim().split('\n').filter(Boolean);
-            if (lines.length) { lastLine = lines[lines.length - 1]; updateStatus(lastLine); }
+            const lines = chunk.toString().replace(/\r/g, '\n').split('\n').map(line => line.trim()).filter(Boolean);
+            const error = lines.find(line => line.includes('Error: '));
+            if (error) lastError = error.slice(error.indexOf('Error: ') + 7).trim();
+            const statusLine = lines.filter(line => /^\[\d+\/\d+\] (preparing|synthesizing|playing)\.\.\.\s*$/.test(line) || line.startsWith('Kokoreader: ')).at(-1);
+            if (statusLine) updateStatus(statusLine);
         };
         activeProc = proc;
         activeTemporary = temporary;
@@ -135,13 +158,19 @@ function activate(context) {
             statusItem.hide();
         };
         proc.stderr.on('data', note);
-        proc.on('error', error => { if (activeProc === proc) vscode.window.showErrorMessage(`Kokoreader: ${error.message}`); finish(); });
-        proc.on('exit', code => {
-            if (code && activeProc === proc) {
+        proc.on('error', error => {
+            if (activeProc === proc) {
+                appendErrorLog(context, { kind: 'reader', event: 'spawn', detail: 'reader process failed to start' });
+                vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
+            }
+            finish();
+        });
+        proc.on('exit', (code, signal) => {
+            if ((code !== 0 || signal) && activeProc === proc) {
                 // Progress is written with \r and the error with no leading newline,
                 // so the two often arrive as one line: "[3/3] synthesizing...Error: …".
-                const at = lastLine.indexOf('Error: ');
-                const detail = at >= 0 ? lastLine.slice(at + 7).trim() : `reader failed (exit ${code})`;
+                const detail = (lastError || (signal ? `reader stopped by ${signal}` : `reader failed (exit ${code})`)).slice(0, 1000);
+                appendErrorLog(context, { kind: 'reader', event: 'exit', code, signal: signal || null, detail: signal ? `reader stopped by ${signal}` : `reader failed (exit ${code})` });
                 vscode.window.showErrorMessage(`Kokoreader: reader failed: ${detail}`);
             }
             finish();
@@ -186,6 +215,14 @@ function activate(context) {
         if (!activeProc || !paused) return;
         paused = false; activeProc.stdin.write('resume\n'); setState(true, false); updateStatus('playing...');
     });
+    const navigate = action => () => {
+        if (!activeProc) return;
+        activeProc.stdin.write(`${action}\n`);
+        updateStatus(paused ? 'paused...' : 'playing...');
+    };
+    const previousCommand = vscode.commands.registerCommand('kokoreader.previousParagraph', navigate('previous'));
+    const replayCommand = vscode.commands.registerCommand('kokoreader.replayParagraph', navigate('replay'));
+    const nextCommand = vscode.commands.registerCommand('kokoreader.nextParagraph', navigate('next'));
     const stopCommand = vscode.commands.registerCommand('kokoreader.stop', stop);
     const saveCommand = vscode.commands.registerCommand('kokoreader.saveFile', async uri => {
         const config = vscode.workspace.getConfiguration('kokoreader');
@@ -240,10 +277,18 @@ function activate(context) {
         const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         item.text = `$(sync~spin) Kokoreader: saving ${path.basename(target.fsPath)}...`;
         item.show();
-        process.on('error', error => { item.dispose(); clearSave(); vscode.window.showErrorMessage(`Kokoreader: ${error.message}`); });
-        process.on('exit', code => { item.dispose(); clearSave(); vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (exit ${code})`); });
+        process.on('error', error => {
+            if (activeSave === process) appendErrorLog(context, { kind: 'export', event: 'spawn', detail: 'export process failed to start' });
+            item.dispose(); clearSave(); vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
+        });
+        process.on('exit', (code, signal) => {
+            if (activeSave === process && (code !== 0 || signal)) {
+                appendErrorLog(context, { kind: 'export', event: 'exit', code, signal: signal || null, detail: signal ? `export stopped by ${signal}` : `export failed (exit ${code})` });
+            }
+            item.dispose(); clearSave(); vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (${signal || `exit ${code}`})`);
+        });
     });
-    context.subscriptions.push(readCommand, cursorCommand, pauseCommand, resumeCommand, stopCommand, saveCommand);
+    context.subscriptions.push(readCommand, cursorCommand, pauseCommand, resumeCommand, previousCommand, replayCommand, nextCommand, stopCommand, saveCommand);
 }
 
 function deactivate() { stop(); }
