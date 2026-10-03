@@ -990,6 +990,40 @@ run('live playback synthesizes the next unit before the current player exits', (
     }
 });
 
+run('navigation during synthesis replaces the worker and plays only the selected paragraph', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n\nThird.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '80' },
+    });
+    child.stderr.resume();
+    try {
+        assert(waitFor(() => stubEvents(paths).some(event => event.action === 'prepare')), 'first paragraph was not prepared');
+        child.stdin.write('next\n');
+        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'worker').length >= 2), 'navigation did not replace the worker');
+        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'ffplay').length >= 1), 'selected paragraph did not play');
+        const events = stubEvents(paths);
+        assert(!events.some(event => event.action === 'synthesize' && event.phonemes === 'First.'), `stale paragraph was synthesized: ${JSON.stringify(events)}`);
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('failed lookahead prevents or stops active playback immediately', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_FAIL_PHONEMES: 'Second.', KKR_STUB_SYNTH_DELAY: '80', KKR_STUB_FFPLAY_HOLD: '1' },
+    });
+    child.stderr.resume();
+    try {
+        const first = waitFor(() => stubEvents(paths).find(event => event.tool === 'ffplay'), 1000);
+        if (first) assert(waitFor(() => !isAlive(first.pid) || null), `lookahead failure left active playback running: ${JSON.stringify(stubEvents(paths))}`);
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
 run('live playback leaves 800 ms between source paragraphs', () => {
     const paths = stubs({ text: 'First.\n\nSecond.\n' });
     const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {

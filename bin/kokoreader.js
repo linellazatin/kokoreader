@@ -420,6 +420,7 @@ let activeWorker = null;
 let activePartFile = null;
 let playbackPaused = false;
 let liveController = null;
+let playbackCancelled = false;
 // The live paragraph's mute, and the callbacks a `resume` has to wake: paragraphs
 // withheld before they started.
 let activePause = null;
@@ -493,6 +494,9 @@ function playSegment(pcm, offset, sampleRate, cfg) {
     return new Promise((resolve, reject) => {
         const ffmpeg = activeFfmpeg = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg), '-f', 'wav', 'pipe:1'], { stdio: ['pipe', 'pipe', 'ignore'] });
         const ffplay = activeFfplay = spawn('ffplay', ['-nodisp', '-autoexit', '-f', 'wav', '-i', 'pipe:0'], { stdio: ['pipe', 'ignore', 'ignore'] });
+        for (const child of [ffmpeg, ffplay]) child.once('spawn', () => {
+            if (playbackCancelled) { try { child.kill(); } catch (_) {} }
+        });
         const started = Date.now();
         // A child that dies mid-stream makes its pipes emit EPIPE/ERR_STREAM_DESTROYED.
         // The 'exit' handlers already report the failure; this only stops an unhandled
@@ -571,49 +575,49 @@ async function* preparedUnits(text, cfg, worker) {
     }
 }
 
-async function playPreparedUnits(units, worker, cfg) {
-    const iterator = units[Symbol.asyncIterator]();
-    let current = await iterator.next();
-    if (current.done) return;
-    let currentAudio = await worker.synthesize(current.value.phonemes, cfg);
-    while (!current.done) {
-        process.stderr.write(`\r[${current.value.paragraph}/${current.value.total}] playing...     `);
-        const playing = playPCM(currentAudio.pcm, currentAudio.sampleRate, cfg);
-        const lookahead = (async () => {
-            while (playbackPaused) await new Promise(wake => onResume.add(wake));
-            const next = await iterator.next();
-            if (next.done) return { next, audio: null };
-            return { next, audio: await worker.synthesize(next.value.phonemes, cfg) };
-        })();
-        await playing;
-        const { next, audio } = await lookahead;
-        if (next.done) break;
-        if (next.value.paragraph !== current.value.paragraph) await delay(PARAGRAPH_PAUSE_MS);
-        current = next;
-        currentAudio = audio;
-    }
-}
-
 class PlaybackController {
     constructor(text, worker, cfg) {
         this.text = text; this.worker = worker; this.cfg = cfg;
-        this.index = Math.max(0, cfg.START_PARA - 1); this.generation = 0; this.prefetched = new Map();
+        this.index = Math.max(0, cfg.START_PARA - 1); this.generation = 0; this.prefetched = new Map(); this.fatal = null;
+    }
+    cancelWorker() {
+        const worker = this.worker;
+        this.worker = null;
+        if (activeWorker === worker) activeWorker = null;
+        playbackCancelled = true;
+        if (activePause) activePause();
+        for (const child of [activeFfmpeg, activeFfplay]) {
+            try { child?.kill(); } catch (_) {}
+        }
+        worker?.close();
+    }
+    ensureWorker() {
+        if (!this.worker) this.worker = activeWorker = new Worker(this.cfg);
+        return this.worker;
     }
     navigate(action) {
         if (action === 'previous') this.index = Math.max(0, this.index - 1);
         if (action === 'next') this.index = Math.min(this.text.length - 1, this.index + 1);
         this.generation++;
         this.prefetched.clear();
-        if (activePause) activePause();
+        this.cancelWorker();
     }
     async prepareParagraph(paragraph, generation) {
         if (this.prefetched.has(paragraph)) return this.prefetched.get(paragraph);
+        const worker = this.ensureWorker();
         const promise = (async () => {
-            const units = await this.worker.prepare(this.text[paragraph], this.cfg);
+            const units = await worker.prepare(this.text[paragraph], this.cfg);
             if (generation !== this.generation) return null;
-            const audio = await this.worker.synthesize(units[0], this.cfg);
+            const audio = await worker.synthesize(units[0], this.cfg);
             return { units, audio };
-        })();
+        })().catch(error => {
+            if (generation === this.generation) {
+                this.fatal = error;
+                this.generation++;
+                this.cancelWorker();
+            }
+            throw error;
+        });
         this.prefetched.set(paragraph, promise);
         return promise;
     }
@@ -622,17 +626,27 @@ class PlaybackController {
             const generation = this.generation;
             const paragraph = this.index;
             process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] preparing...`);
-            const prepared = await this.prepareParagraph(paragraph, generation);
+            let prepared;
+            try { prepared = await this.prepareParagraph(paragraph, generation); }
+            catch (error) { if (generation !== this.generation) continue; throw error; }
             if (!prepared || generation !== this.generation) continue;
             for (let unit = 0; unit < prepared.units.length; unit++) {
                 process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] synthesizing...`);
-                const audio = unit === 0 ? prepared.audio : await this.worker.synthesize(prepared.units[unit], this.cfg);
+                let audio;
+                try { audio = unit === 0 ? prepared.audio : await this.ensureWorker().synthesize(prepared.units[unit], this.cfg); }
+                catch (error) { if (generation !== this.generation) break; throw error; }
                 if (generation !== this.generation) break;
                 process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] playing...     `);
                 const lookahead = unit === prepared.units.length - 1 && paragraph + 1 < this.text.length ?
                     this.prepareParagraph(paragraph + 1, generation) : null;
+                await Promise.resolve();
+                if (this.fatal) throw this.fatal;
+                playbackCancelled = false;
                 await playPCM(audio.pcm, audio.sampleRate, this.cfg);
-                if (lookahead) await lookahead;
+                if (lookahead) {
+                    try { await lookahead; }
+                    catch (error) { if (generation === this.generation) throw error; }
+                }
                 if (generation !== this.generation) break;
             }
             if (generation !== this.generation) continue;
@@ -640,6 +654,7 @@ class PlaybackController {
             if (this.index < this.text.length) await delay(PARAGRAPH_PAUSE_MS);
         }
     }
+    close() { this.cancelWorker(); }
 }
 
 async function read(inputFile, cfg) {
@@ -649,7 +664,7 @@ async function read(inputFile, cfg) {
     const text = paragraphs(raw, cfg);
     if (!text.length) throw new Error('Nothing to read.');
     if (cfg.START_PARA > text.length) throw new Error(`start-para must be no greater than the number of paragraphs (${text.length})`);
-    const worker = activeWorker = new Worker(cfg);
+    let worker = activeWorker = new Worker(cfg);
     let saver = null;
     try {
         const units = preparedUnits(text, cfg, worker);
@@ -678,7 +693,7 @@ async function read(inputFile, cfg) {
         if (saver) saver.abort();
         throw error;
     } finally {
-        worker.close();
+        if (liveController) liveController.close(); else worker.close();
         activeWorker = null;
         liveController = null;
         if (inputFile) process.stdin.destroy();
