@@ -111,6 +111,12 @@ const fs = require('fs'), readline = require('readline');
 const events = ${JSON.stringify(paths.events)};
 const delay = Number(process.env.KKR_STUB_SYNTH_DELAY || 0);
 fs.appendFileSync(events, JSON.stringify({ tool: 'worker', pid: process.pid }) + '\\n');
+const ready = () => {
+  fs.appendFileSync(events, JSON.stringify({ tool: 'worker-ready', at: Date.now() }) + '\\n');
+  process.stdout.write(JSON.stringify({ ready: true }) + '\\n');
+};
+const readyDelay = Number(process.env.KKR_STUB_READY_DELAY || 0);
+readyDelay ? setTimeout(ready, readyDelay) : ready();
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const request = JSON.parse(line);
   fs.appendFileSync(events, JSON.stringify({ ...request, at: Date.now() }) + '\\n');
@@ -275,7 +281,7 @@ fs.mkdirSync(tools);
 fs.writeFileSync(input, 'A short selection.');
 fs.writeFileSync(model, 'model');
 fs.writeFileSync(voices, 'voices');
-fs.writeFileSync(worker, '#!/usr/bin/env node\nconst readline = require("readline");\nreadline.createInterface({ input: process.stdin }).on("line", line => { const request = JSON.parse(line); const response = request.action === "prepare" ? { id: request.id, units: [request.text] } : { id: request.id, pcm: "AAA=", sampleRate: 24000 }; process.stdout.write(JSON.stringify(response) + "\\n"); });\n');
+fs.writeFileSync(worker, '#!/usr/bin/env node\nconst readline = require("readline");\nprocess.stdout.write(JSON.stringify({ ready: true }) + "\\n");\nreadline.createInterface({ input: process.stdin }).on("line", line => { const request = JSON.parse(line); const response = request.action === "prepare" ? { id: request.id, units: [request.text] } : { id: request.id, pcm: "AAA=", sampleRate: 24000 }; process.stdout.write(JSON.stringify(response) + "\\n"); });\n');
 fs.writeFileSync(path.join(tools, 'ffmpeg'), '#!/usr/bin/env node\nconst fs = require("fs");\nconst out = process.argv[process.argv.length - 1];\nif (out !== "pipe:1") process.stdin.on("data", c => fs.appendFileSync(out, c));\nprocess.stdin.on("end", () => process.exit(0));\n');
 fs.chmodSync(worker, 0o755);
 fs.chmodSync(path.join(tools, 'ffmpeg'), 0o755);
@@ -530,6 +536,30 @@ run('reader failures always append a source-free extension error record', () => 
         assert(fs.existsSync(log), 'debug reader failure did not create err.jsonl');
         const entry = JSON.parse(fs.readFileSync(log, 'utf8'));
         assert(entry.kind === 'reader' && entry.code === 1 && !JSON.stringify(entry).includes('source text'), JSON.stringify(entry));
+    } finally {
+        harness.extension.deactivate();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+run('extension error logs rotate before they grow without bound', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-error-log-'));
+    const extensionPath = path.join(dir, 'extension');
+    const activePath = path.join(dir, 'input.md');
+    fs.mkdirSync(path.join(extensionPath, 'logs'), { recursive: true });
+    const log = path.join(extensionPath, 'logs', 'err.jsonl');
+    fs.writeFileSync(log, 'x'.repeat(1024 * 1024));
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: activePath, scheme: 'file', toString: () => `file://${activePath}` }, fileName: activePath, getText: () => 'text' },
+    }, { extensionPath });
+    try {
+        harness.commands.get('kokoreader.readFile')();
+        harness.spawned[0].child.emit('exit', 1);
+        const archived = path.join(extensionPath, 'logs', 'err.jsonl.1');
+        assert(fs.existsSync(archived), 'oversized error log was not rotated');
+        assert(fs.statSync(archived).size === 1024 * 1024, 'rotated log did not retain the old records');
+        assert(JSON.parse(fs.readFileSync(log, 'utf8')).kind === 'reader', 'new error record was not written to a fresh log');
     } finally {
         harness.extension.deactivate();
         fs.rmSync(dir, { recursive: true, force: true });
@@ -1040,6 +1070,19 @@ run('worker requests time out and name their action', () => {
     assert(source.includes('${message.action} timed out after 120 seconds'), 'worker timeout does not name the request action');
 });
 
+run('worker does not send requests until model startup reports ready', () => {
+    const paths = stubs();
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', path.join(paths.dir, 'o.wav'), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_READY_DELAY: '300' },
+    });
+    const events = stubEvents(paths);
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    const ready = events.find(event => event.tool === 'worker-ready');
+    const prepare = events.find(event => event.action === 'prepare');
+    assert(result.status === 0, result.stderr);
+    assert(ready && prepare && prepare.at >= ready.at, `request preceded worker readiness: ${JSON.stringify(events)}`);
+});
+
 run('threads and pronunciation options validate and extension forwards them', () => {
     const invalid = cli(['--threads', '-1']);
     const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
@@ -1059,6 +1102,17 @@ run('pronunciations apply before markdown and use longest whole literal match', 
     fs.rmSync(paths.dir, { recursive: true, force: true });
     assert(result.status === 0, result.stderr);
     assert(prepared.text.includes('long phrase long phrase nmnm.jsoncx'), prepared.text);
+});
+
+run('pronunciation replacements do not cascade into later dictionary keys', () => {
+    const paths = stubs({ text: 'foo bar\n' });
+    const dictionary = path.join(paths.dir, 'pronunciations.json');
+    fs.writeFileSync(dictionary, JSON.stringify({ foo: 'bar', bar: 'baz' }));
+    const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--pronunciations', dictionary, '--output', path.join(paths.dir, 'o.wav'), paths.input], { env: { ...process.env, ...stubEnv(paths) } });
+    const prepared = stubEvents(paths).find(event => event.action === 'prepare');
+    fs.rmSync(paths.dir, { recursive: true, force: true });
+    assert(result.status === 0, result.stderr);
+    assert(prepared.text === 'bar baz', `replacement cascaded: ${prepared.text}`);
 });
 
 run('invalid pronunciation dictionaries fail before worker startup', () => {
@@ -1117,6 +1171,26 @@ run('navigation during synthesis replaces the worker and plays only the selected
         assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'ffplay').length >= 1), 'selected paragraph did not play');
         const events = stubEvents(paths);
         assert(!events.some(event => event.action === 'synthesize' && event.phonemes === 'First.'), `stale paragraph was synthesized: ${JSON.stringify(events)}`);
+    } finally {
+        child.kill();
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('navigation during the source paragraph gap cancels it and starts the newest target promptly', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n\nThird.\n' });
+    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_FFPLAY_HOLD_MS: '80' },
+    });
+    child.stderr.resume();
+    try {
+        const firstExit = waitFor(() => stubEvents(paths).find(event => event.tool === 'ffplay-exit'));
+        assert(firstExit, 'first paragraph did not finish');
+        const started = Date.now();
+        child.stdin.write('next\n');
+        assert(waitFor(() => stubEvents(paths).some(event => event.action === 'synthesize' && event.phonemes === 'Third.'), 600),
+            `newest paragraph did not begin promptly: ${JSON.stringify(stubEvents(paths))}`);
+        assert(Date.now() - started < 600, 'navigation waited for the 800 ms paragraph gap');
     } finally {
         child.kill();
         fs.rmSync(paths.dir, { recursive: true, force: true });

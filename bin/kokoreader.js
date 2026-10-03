@@ -42,6 +42,8 @@ const VOICE_LANGS = Object.freeze({
     i: 'it', j: 'ja', p: 'pt-br', z: 'cmn',
 });
 const WORKER_TIMEOUT_MS = 120000;
+const WORKER_SHUTDOWN_MS = 1500;
+const WORKER_STARTUP_TIMEOUT_MS = 20000;
 
 const INSTALL_DIR = path.join(__dirname, '..');
 const PATH_CONFIG_KEYS = new Set(['MODEL_DIR', 'MODEL_PATH', 'VOICES_PATH', 'PRONUNCIATIONS_PATH']);
@@ -187,7 +189,7 @@ function normalizeTechnicalTokens(text) {
 }
 
 function loadPronunciations(file) {
-    if (!file) return [];
+    if (!file) return null;
     let dictionary;
     try { dictionary = JSON.parse(fs.readFileSync(file, 'utf8')); }
     catch (error) { throw new Error(`pronunciations: cannot read valid JSON from ${file}: ${error.message}`); }
@@ -196,15 +198,17 @@ function loadPronunciations(file) {
     if (!entries.every(([key, value]) => typeof key === 'string' && key && typeof value === 'string' && value)) {
         throw new Error('pronunciations: keys and values must be nonempty strings');
     }
-    return entries.sort(([a], [b]) => b.length - a.length);
+    entries.sort(([a], [b]) => b.length - a.length);
+    const escaped = entries.map(([phrase]) => phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    return {
+        matcher: new RegExp(`(?<![\\p{L}\\p{N}_.-])(?:${escaped.join('|')})(?![\\p{L}\\p{N}_.-])`, 'gu'),
+        replacements: new Map(entries),
+    };
 }
 
-function applyPronunciations(text, entries) {
-    for (const [phrase, spoken] of entries) {
-        const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        text = text.replace(new RegExp(`(?<![\\p{L}\\p{N}_.-])${escaped}(?![\\p{L}\\p{N}_.-])`, 'gu'), spoken);
-    }
-    return text;
+function applyPronunciations(text, dictionary) {
+    if (!dictionary) return text;
+    return text.replace(dictionary.matcher, phrase => dictionary.replacements.get(phrase));
 }
 
 function normalizeCurrencies(text) {
@@ -345,25 +349,57 @@ class Worker {
         this.pending = new Map();
         this.nextId = 1;
         this.exited = false;
+        this.closeTimer = null;
+        this.exitPromise = new Promise(resolve => { this.resolveExit = resolve; });
+        this.readyPending = true;
+        this.ready = new Promise((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject; });
+        this.readyTimeout = setTimeout(() => {
+            const error = new Error('Kokoro worker did not become ready within 20 seconds');
+            this.fail(error);
+            this.close();
+        }, WORKER_STARTUP_TIMEOUT_MS);
         readline.createInterface({ input: this.proc.stdout }).on('line', line => this.receive(line));
         this.proc.stderr.on('data', chunk => { if (cfg.DEBUG) process.stderr.write(chunk); });
-        this.proc.on('error', error => this.fail(error));
+        this.proc.on('error', error => {
+            this.fail(error);
+            this.finishExit();
+        });
         this.proc.on('exit', (code, signal) => {
             this.exited = true;
-            if (this.pending.size) this.fail(new Error(code === null ? `Kokoro worker exited from ${signal || 'a signal'}` : `Kokoro worker exited with code ${code}`));
+            this.finishExit();
+            this.fail(new Error(code === null ? `Kokoro worker exited from ${signal || 'a signal'}` : `Kokoro worker exited with code ${code}`));
         });
     }
     receive(line) {
         let message;
         try { message = JSON.parse(line); } catch (_) { return; }
+        if (message.ready === true) {
+            if (this.readyPending) {
+                this.readyPending = false;
+                clearTimeout(this.readyTimeout);
+                this.resolveReady();
+            }
+            return;
+        }
         const pending = this.pending.get(message.id);
         if (!pending) return;
         this.pending.delete(message.id);
         clearTimeout(pending.timeout);
         if (message.error) pending.reject(new Error(message.error)); else pending.resolve(message);
     }
-    fail(error) { for (const { reject, timeout } of this.pending.values()) { clearTimeout(timeout); reject(error); } this.pending.clear(); }
+    fail(error) {
+        if (this.readyPending) {
+            this.readyPending = false;
+            clearTimeout(this.readyTimeout);
+            this.rejectReady(new Error(`Kokoro worker failed before startup completed: ${error.message}`));
+        }
+        for (const { reject, timeout } of this.pending.values()) { clearTimeout(timeout); reject(error); }
+        this.pending.clear();
+    }
     request(message) {
+        return this.ready.then(() => this.sendRequest(message));
+    }
+    sendRequest(message) {
         return new Promise((resolve, reject) => {
             if (this.exited || this.proc.stdin.destroyed || this.proc.stdin.writableEnded) return reject(new Error('Kokoro worker is not running'));
             const id = this.nextId++;
@@ -402,7 +438,23 @@ class Worker {
     }
     async list() { return (await this.request({ action: 'list' })).voices; }
     async languages() { return this.request({ action: 'languages' }); }
-    close() { try { this.proc.kill(); } catch (_) {} }
+    finishExit() {
+        clearTimeout(this.readyTimeout);
+        if (this.closeTimer) clearTimeout(this.closeTimer);
+        this.closeTimer = null;
+        this.resolveExit();
+    }
+    close() {
+        if (!this.exited) {
+            try { this.proc.kill('SIGTERM'); } catch (_) {}
+            if (!this.closeTimer) {
+                this.closeTimer = setTimeout(() => {
+                    if (!this.exited) { try { this.proc.kill('SIGKILL'); } catch (_) {} }
+                }, WORKER_SHUTDOWN_MS);
+            }
+        }
+        return this.exitPromise;
+    }
 }
 
 // espeak-ng degrades a whole paragraph the same way, so one report per distinct
@@ -579,19 +631,26 @@ class PlaybackController {
     constructor(text, worker, cfg) {
         this.text = text; this.worker = worker; this.cfg = cfg;
         this.index = Math.max(0, cfg.START_PARA - 1); this.generation = 0; this.prefetched = new Map(); this.fatal = null;
+        this.workerClosing = Promise.resolve(); this.cancelGap = null;
     }
     cancelWorker() {
         const worker = this.worker;
         this.worker = null;
         if (activeWorker === worker) activeWorker = null;
+        if (worker) this.workerClosing = Promise.race([
+            worker.close().catch(() => {}),
+            delay(WORKER_SHUTDOWN_MS + 100),
+        ]);
         playbackCancelled = true;
+        if (this.cancelGap) this.cancelGap();
         if (activePause) activePause();
         for (const child of [activeFfmpeg, activeFfplay]) {
             try { child?.kill(); } catch (_) {}
         }
-        worker?.close();
     }
-    ensureWorker() {
+    async ensureWorker(generation) {
+        await this.workerClosing;
+        if (generation !== undefined && generation !== this.generation) return null;
         if (!this.worker) this.worker = activeWorker = new Worker(this.cfg);
         return this.worker;
     }
@@ -604,8 +663,9 @@ class PlaybackController {
     }
     async prepareParagraph(paragraph, generation) {
         if (this.prefetched.has(paragraph)) return this.prefetched.get(paragraph);
-        const worker = this.ensureWorker();
         const promise = (async () => {
+            const worker = await this.ensureWorker(generation);
+            if (!worker) return null;
             const units = await worker.prepare(this.text[paragraph], this.cfg);
             if (generation !== this.generation) return null;
             const audio = await worker.synthesize(units[0], this.cfg);
@@ -633,12 +693,17 @@ class PlaybackController {
             for (let unit = 0; unit < prepared.units.length; unit++) {
                 process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] synthesizing...`);
                 let audio;
-                try { audio = unit === 0 ? prepared.audio : await this.ensureWorker().synthesize(prepared.units[unit], this.cfg); }
+                try {
+                    const worker = unit === 0 ? null : await this.ensureWorker(generation);
+                    if (unit && !worker) break;
+                    audio = unit === 0 ? prepared.audio : await worker.synthesize(prepared.units[unit], this.cfg);
+                }
                 catch (error) { if (generation !== this.generation) break; throw error; }
                 if (generation !== this.generation) break;
                 process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] playing...     `);
                 const lookahead = unit === prepared.units.length - 1 && paragraph + 1 < this.text.length ?
                     this.prepareParagraph(paragraph + 1, generation) : null;
+                if (lookahead) lookahead.catch(() => {});
                 await Promise.resolve();
                 if (this.fatal) throw this.fatal;
                 playbackCancelled = false;
@@ -651,8 +716,20 @@ class PlaybackController {
             }
             if (generation !== this.generation) continue;
             this.index++;
-            if (this.index < this.text.length) await delay(PARAGRAPH_PAUSE_MS);
+            if (this.index < this.text.length) await this.waitForParagraphGap();
         }
+    }
+    waitForParagraphGap() {
+        return new Promise(resolve => {
+            let done;
+            const timer = setTimeout(() => done(), PARAGRAPH_PAUSE_MS);
+            const cancel = () => { clearTimeout(timer); done(); };
+            done = () => {
+                if (this.cancelGap === cancel) this.cancelGap = null;
+                resolve();
+            };
+            this.cancelGap = cancel;
+        });
     }
     close() { this.cancelWorker(); }
 }

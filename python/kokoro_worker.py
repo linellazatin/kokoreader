@@ -134,6 +134,7 @@ def main():
     session = ort.InferenceSession(args.model, sess_options=options)
     kokoro = Kokoro.from_session(session, args.voices)
     names = EspeakBackend.supported_languages()
+    emit({'ready': True})
 
     for line in sys.stdin:
         request = json.loads(line)

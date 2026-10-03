@@ -14,6 +14,7 @@ let saveGeneration = 0;
 let statusItem = null;
 let paused = false;
 let activeTemporary = null;
+const ERROR_LOG_MAX_BYTES = 1024 * 1024;
 
 function setState(playing, isPaused) {
     vscode.commands.executeCommand('setContext', 'kokoreader.isPlaying', playing);
@@ -115,6 +116,11 @@ function appendErrorLog(context, entry) {
     for (const file of files) {
         try {
             fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+            if (fs.existsSync(file) && fs.statSync(file).size >= ERROR_LOG_MAX_BYTES) {
+                const archived = `${file}.1`;
+                try { fs.unlinkSync(archived); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+                fs.renameSync(file, archived);
+            }
             fs.appendFileSync(file, line, { encoding: 'utf8', mode: 0o600 });
             return;
         } catch (_) {}
