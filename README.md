@@ -25,11 +25,11 @@ Use the CLI for files and pipelines, or use the VS Code/VSCodium extension to re
 
 Kokoreader phonemizes text before synthesis, splits it safely below Kokoro’s model boundary, and keeps one upcoming unit synthesized while the current one plays. That avoids the long-paragraph bounds failure and reduces dead air caused by waiting for the next inference.
 
-It preserves a natural **800 ms** gap between source paragraphs in both live playback and saved audio, without adding pauses inside a paragraph that was safely split into multiple units.
+It preserves a natural **800 ms** gap between source paragraphs in both live playback and saved audio, without adding pauses inside a paragraph that was safely split into multiple units. The first unit targets an early sentence boundary within 200 phonemes to reduce time to first audio; later units retain the 500-phoneme safety boundary.
 
 ### Markdown-aware, without silently hiding structure
 
-Formatting, links, images, and HTML are removed before speech. Block quotes are announced as “Quote.”, including quoted task and list items; task-list items are “Checked item.” or “Unchecked item.”, and regular list items retain an item marker. The default technical profile says “The code is - ” and reads closed triple-backtick code blocks. Use `-p narrative` or set `PROFILE=narrative` to announce them instead:
+Formatting, links, images, and HTML are removed before speech. Block quotes are announced as “Quote.”, including quoted task and list items; task-list items are “Checked item.” or “Unchecked item.”, unordered list items receive a short pause instead of an item marker, and ordered lists retain their number. The default technical profile says “The code is - ” and reads closed triple-backtick code blocks. Use `-p narrative` or set `PROFILE=narrative` to announce them instead:
 
 > "A code block follows. You can see the code in the document."
 
@@ -39,7 +39,7 @@ Formatting, links, images, and HTML are removed before speech. Block quotes are 
 
 ### Language-aware Markdown labels
 
-The speech-inserted Markdown labels follow `--lang` / `kokoreader.lang`: code-block introductions, table/column/row/blank-cell markers, quotes, task state, and list items are mapped for `en-us`, `en-gb`, `es`, `fr-fr`, `hi`, `it`, `ja`, `pt-br`, and `cmn`. Any other language code uses English labels. Technical-token normalization, including “dot”, “dash”, and currency names, remains English in this release.
+The speech-inserted Markdown labels follow `--lang` / `kokoreader.lang`: code-block introductions, table/column/row/blank-cell markers, quotes, task state, and ordered-list numbers are mapped for `en-us`, `en-gb`, `es`, `fr-fr`, `hi`, `it`, `ja`, `pt-br`, and `cmn`. Any other language code uses English labels. Technical-token normalization, including “dot”, “dash”, and currency names, remains English in this release.
 
 ### Playback controls that respect listening
 
@@ -205,7 +205,7 @@ node bin/kokoreader.js README.md
 node bin/kokoreader.js --output README.wav README.md
 ```
 
-Expect paragraph progress. Kokoreader phonemizes and splits each paragraph into safe units of at most 500 phonemes before synthesis. It synthesizes the first unit before playback, then synthesizes one upcoming unit while the current unit plays. It adds a natural 800 ms silent gap between source paragraphs in both live playback and saved audio, but not between safe units from the same paragraph. With a file input, a controlling process can send `pause`, `resume`, and `stop` through stdin. `pause` ends the paragraph's player at once; `resume` replays that paragraph from where it was heard, backed off by about 0.8 s. With no file, stdin is text input:
+Expect paragraph progress. Kokoreader phonemizes and splits each paragraph into safe units before synthesis. It adds a natural 800 ms silent gap between source paragraphs in both live playback and saved audio, but not between safe units from the same paragraph. With a file input, a controlling process can send `pause`, `resume`, `previous`, `replay`, `next`, and `stop` through stdin. Navigation is paragraph-based; it cancels stale work and keeps the paused state. `pause` ends the paragraph's player at once; `resume` replays that paragraph from where it was heard, backed off by about 0.8 s. With no file, stdin is text input:
 
 ```sh
 printf 'Hello from Kokoreader.\n' | node bin/kokoreader.js
@@ -227,9 +227,11 @@ printf 'Hello from Kokoreader.\n' | node bin/kokoreader.js
 | `-lim`, `--limiter`; `-nlim`, `--no-limiter` | Enable or disable final peak limiting. |
 | `-o`, `--output FILE` | Save audio instead of playing. Use an extension that matches `--format`. |
 | `-sp`, `--start-para N` | Start at one-based paragraph N; `0` reads from the beginning. |
+| `--threads N` | Cap ONNX Runtime inference threads. `0` is the default and lets ONNX Runtime choose. |
+| `--pronunciations FILE` | Read a local JSON pronunciation replacement dictionary. |
 | `-d`, `--download` | Download selected assets to `--model-dir`. |
 | `--force` | With `--download`, replace assets whose SHA-256 does not match the release. |
-| `-ls`, `--list`; `-ll`, `--list-languages`; `-dbg`, `--debug` | List voices, list accepted language codes, or show worker errors. Add `--lang CODE` to `--list` to show only installed voices matching that Kokoro voice language. |
+| `-ls`, `--list`; `-ll`, `--list-languages`; `-dbg`, `--debug` | List voices, list accepted language codes, or show worker errors. The extension always appends failed reads and exports to `err.jsonl`. Add `--lang CODE` to `--list` to show only installed voices matching that Kokoro voice language. |
 
 Input is plain text or Markdown. Formatting, links, images, and HTML tags are removed before synthesis. The default `technical` profile says “The code is - ” before reading a closed triple-backtick fenced code block. With `-p narrative`, the block is replaced with the spoken paragraph:
 
@@ -237,7 +239,15 @@ Input is plain text or Markdown. Formatting, links, images, and HTML tags are re
 “A code block follows. You can see the code in the document.”
 ```
 
-Inline backtick code is normalized as a technical token in both profiles: dots become “dot”, underscores become “underscore”, path separators become “slash” or “backslash”, hyphens become “dash”, and camelCase gets a word boundary. Thus `nmnm.jsonc` is read as “nmnm dot jsonc.” In either profile, a dot directly between digits is read as “dot”, so `3.11` becomes “3 dot 11.” Currency decimals instead use “point” and a trailing currency name: `$3.50`, `€45.35`, `£1.00`, and `¥0.75` become “3 point 50 dollars,” “45 point 35 euros,” “1 point 00 pounds,” and “0 point 75 yen.” Block quotes are announced, task-list state is spoken, and unordered or ordered lists retain item markers. These inserted labels use the configured language map for `en-us`, `en-gb`, `es`, `fr-fr`, `hi`, `it`, `ja`, `pt-br`, and `cmn`; unsupported codes use English labels. Well-formed GitHub-flavored pipe tables, including one-column tables, are read in both profiles as a table and column announcement followed by one labeled row per paragraph; blank cells use the configured language’s blank marker. Malformed tables remain source text. The `technical` profile uses the configured language’s code introduction before reading each closed triple-backtick fence with those rules. Tilde fences and unclosed fences retain their literal text.
+Inline backtick code is normalized as a technical token in both profiles: dots become “dot”, underscores become “underscore”, path separators become “slash” or “backslash”, hyphens become “dash”, and camelCase gets a word boundary. Thus `nmnm.jsonc` is read as “nmnm dot jsonc.” In either profile, a dot directly between digits is read as “dot”, so `3.11` becomes “3 dot 11.” Currency decimals instead use “point” and a trailing currency name: `$3.50`, `€45.35`, `£1.00`, and `¥0.75` become “3 point 50 dollars,” “45 point 35 euros,” “1 point 00 pounds,” and “0 point 75 yen.” Block quotes are announced, task-list state is spoken, unordered list bullets produce a short pause, and ordered lists retain numbered markers. These inserted labels use the configured language map for `en-us`, `en-gb`, `es`, `fr-fr`, `hi`, `it`, `ja`, `pt-br`, and `cmn`; unsupported codes use English labels. Well-formed GitHub-flavored pipe tables, including one-column tables, are read in both profiles as a table and column announcement followed by one labeled row per paragraph; blank cells use the configured language’s blank marker. Malformed tables remain source text. The `technical` profile uses the configured language’s code introduction before reading each closed backtick or tilde fence with those rules. Unclosed fences remain literal source text.
+
+### Pronunciations and CPU budget
+
+Set `--pronunciations FILE`, `PRONUNCIATIONS_PATH`, or `kokoreader.pronunciationsPath` to a readable local JSON object such as `{ "nmnm.jsonc": "n m n m dot json c" }`. Replacements are case-sensitive, match whole literal phrases, prefer longer keys, run only against original source text, and run before Markdown and technical-token processing. Empty keys or values and malformed JSON stop the read before the worker starts. Set `--threads N`, `THREADS`, or `kokoreader.threads` to cap ONNX Runtime CPU use. Keep `0`: the current listening comparison found longer synthesis pauses with explicit caps of 2 and 4. The worker reports ready after model startup; startup that exceeds 20 seconds and requests that exceed 120 seconds stop the worker with a named error.
+
+### Debug error log
+
+Every failed extension read or Save to File export appends one JSON Lines record. Records contain only timestamp, operation, process event, exit code or signal, and a generated summary; raw stderr, source text, and audio are never recorded. `kokoreader.debug` still exposes worker errors without replacing playback progress. Kokoreader first writes `<extension>/logs/err.jsonl`, for example `/Users/lines/.vscode-oss/extensions/openlines.kokoreader-0.3.0/logs/err.jsonl`; if that installed directory is not writable, it uses the editor's extension log storage instead. The file rotates at 1 MiB, retaining one previous file as `err.jsonl.1`.
 
 ## VS Code and VSCodium setup
 
@@ -256,35 +266,25 @@ Right-click an editor tab for **Read**, **Read From Cursor**, **Pause**, **Resum
 
 ## Voice quality and performance controls
 
-### Available now
+### Implemented controls
 
-| Setting | Effect | Viability |
-| --- | --- | --- |
-| `voice` / `VOICE` / `--voice` | Selects Kokoro timbre and style. | Implemented. |
-| `lang` / `LANG` / `--lang` | Selects language/phonemization behavior. In VS Code, the dropdown contains Kokoro-82M’s supported voice languages: `en-us`, `en-gb`, `es`, `fr-fr`, `hi`, `it`, `ja`, `pt-br`, and `cmn`. The CLI remains flexible for any installed **espeak-ng** code; use `--list --lang CODE` to list matching installed voices. | Implemented. |
-| `profile` / `PROFILE` / `-p`, `--profile` | Selects `technical` (default; say “The code is - ” then read closed fenced code) or `narrative` (announce it). Inline backtick code is normalized technically in both profiles. | Implemented. |
-| `speed` / `SPEED` / `--speed` | Changes Kokoro synthesis speed. Kokoreader enforces the 0.5-2.0 range that `kokoro-onnx` accepts; use `tempo` for larger changes. | Implemented. |
-| `tempo` / `TEMPO` / `--tempo` | Changes final speed while preserving pitch. | Implemented; use moderate values for best quality. |
-| `gain` / `GAIN` / `--gain` | Sets output headroom in dB. Negative gain reduces clipping risk. | Implemented. |
-| `volume` / `VOLUME` / `--volume` | Sets final loudness multiplier. | Implemented. |
-| `format` / `FORMAT` / `--format` | Selects WAV, MP3, FLAC, or Opus for saved audio. | Implemented. |
-| `sampleRate` / `SAMPLE_RATE` / `--sample-rate` | Converts only saved audio; `0` preserves Kokoro's source rate. | Implemented. |
-| `normalize` / `NORMALIZE` / `--normalize` | Applies EBU R128 loudness normalization. | Implemented; off by default because it changes intended loudness. |
-| `limiter` / `LIMITER` / `--limiter` | Caps peaks after gain, tempo, and optional normalization. | Implemented; on by default. |
-| `modelDir`, `modelPath`, `voicesPath`, `modelPrecision` | Chooses installed model assets and FP32/FP16/INT8 precision. | Implemented. |
-| `pythonPath` | Chooses the Python inference environment. | Implemented. |
-
-### Viable additions, not exposed yet
-
-| Control | Value | Viability |
-| --- | --- | --- |
-| Weighted two-voice blend | `voiceA:60,voiceB:40` | Viable. Kokoro exposes voice-style vectors; the worker needs blend parsing and validation. |
-| Editor voice/language picker | Quick-pick settings | Viable. The worker already lists voices and language codes; the editor still needs the picker UI. |
-| Execution provider | CPU, CUDA, CoreML, DirectML, OpenVINO | Viable only with direct ONNX Runtime session control. The current worker uses the wrapper's default CPU provider. |
-| Thread counts | ONNX intra/inter-op limits | Viable only after direct session control. |
-| Paragraph silence/fades | Gap and boundary behavior | Viable through ffmpeg. |
-
-Piper noise scales, speaker IDs, and phoneme-length scale have no Kokoro equivalent and should not be exposed.
+| Setting | Effect |
+| --- | --- |
+| `voice` / `VOICE` / `--voice` | Selects Kokoro timbre and style. |
+| `lang` / `LANG` / `--lang` | Selects language and phonemization behavior. VS Code offers Kokoro-82M’s supported languages; the CLI accepts any installed **espeak-ng** code. |
+| `profile` / `PROFILE` / `-p`, `--profile` | Selects `technical` (read closed code fences) or `narrative` (announce them). |
+| `speed` / `SPEED` / `--speed` | Changes Kokoro synthesis speed within 0.5-2.0. |
+| `threads` / `THREADS` / `--threads` | Caps ONNX Runtime inference threads; keep `0` for the current default because listening tests found longer synthesis pauses with 2 and 4. |
+| `tempo` / `TEMPO` / `--tempo` | Changes final playback speed while preserving pitch. |
+| `gain` / `GAIN` / `--gain` | Sets output headroom in dB. |
+| `volume` / `VOLUME` / `--volume` | Sets final loudness multiplier. |
+| `format` / `FORMAT` / `--format` | Selects WAV, MP3, FLAC, or Opus for saved audio. |
+| `sampleRate` / `SAMPLE_RATE` / `--sample-rate` | Converts saved audio; `0` preserves Kokoro’s source rate. |
+| `normalize` / `NORMALIZE` / `--normalize` | Applies EBU R128 loudness normalization. |
+| `limiter` / `LIMITER` / `--limiter` | Caps peaks after gain, tempo, and optional normalization. |
+| `pronunciationsPath` / `PRONUNCIATIONS_PATH` / `--pronunciations` | Applies literal source-phrase replacements before Markdown and technical-token processing. |
+| `modelDir`, `modelPath`, `voicesPath`, `modelPrecision` | Chooses installed model assets and FP32/FP16/INT8 precision. |
+| `pythonPath` | Chooses the Python inference environment. |
 
 ### Languages, voices, and mismatch warnings
 
@@ -392,6 +392,10 @@ Japanese and Mandarin are the weakest pairings: upstream trains them with misaki
 | `Kokoreader: NN% of the phonemes ... were dropped` | Expected for `cmn`/`yue`: tone digits and vowels are outside Kokoro's vocabulary. Non-Latin output quality is limited by espeak-ng, not by Kokoreader. |
 | `does not match the kokoro-onnx model-files-v1.0 release` | The asset is stale or truncated. Rerun with `--download --force` to replace it. |
 | Worker error | Retry with `--debug` to reveal the Python exception. |
+
+## Known bugs
+
+No reproducible known bugs are currently tracked. Mixed-language Japanese and Mandarin quality remains a documented engine limitation.
 
 ## Credits and licensing
 
