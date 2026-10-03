@@ -283,6 +283,27 @@ setTimeout(() => { child.kill(); cleanup(); process.exit(1); }, 5000);
     assert(result.status === 0, `file-reading child did not exit: ${result.stderr}`);
 });
 
+run('file-read validation failures close the extension IPC pipe', () => {
+    const probe = String.raw`
+const { spawn } = require('child_process');
+const path = require('path');
+const root = process.argv[1];
+const args = JSON.parse(process.argv[2]);
+const child = spawn(process.execPath, [path.join(root, 'bin', 'kokoreader.js'), ...args], { stdio: ['pipe', 'ignore', 'pipe'] });
+child.stderr.resume();
+child.on('exit', code => process.exit(code === 0 ? 2 : 0));
+setTimeout(() => { child.kill(); process.exit(1); }, 1500);
+`;
+    for (const args of [
+        ['--start-para', '999', 'package.json'],
+        ['--pronunciations', '/missing/kokoreader-pronunciations.json', 'package.json'],
+        ['--model', '/missing/kokoreader-model.onnx', '--voices', '/missing/kokoreader-voices.bin', 'package.json'],
+    ]) {
+        const result = spawnSync(process.execPath, ['-e', probe, ROOT, JSON.stringify(args)], { cwd: ROOT, encoding: 'utf8', timeout: 4000 });
+        assert(result.status === 0, `file-read validation left IPC open for ${args.join(' ')}: ${result.stderr}`);
+    }
+});
+
 run('extension manifest exposes read, playback, and save commands', () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
     const commands = manifest.contributes.commands.map(command => command.command);

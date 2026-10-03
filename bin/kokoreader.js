@@ -659,14 +659,15 @@ class PlaybackController {
 
 async function read(inputFile, cfg) {
     if (inputFile) setupIPC();
-    const raw = inputFile ? fs.readFileSync(inputFile, 'utf8') : await readStdin();
-    cfg.PRONUNCIATIONS = loadPronunciations(cfg.PRONUNCIATIONS_PATH);
-    const text = paragraphs(raw, cfg);
-    if (!text.length) throw new Error('Nothing to read.');
-    if (cfg.START_PARA > text.length) throw new Error(`start-para must be no greater than the number of paragraphs (${text.length})`);
-    let worker = activeWorker = new Worker(cfg);
+    let worker = null;
     let saver = null;
     try {
+        const raw = inputFile ? fs.readFileSync(inputFile, 'utf8') : await readStdin();
+        cfg.PRONUNCIATIONS = loadPronunciations(cfg.PRONUNCIATIONS_PATH);
+        const text = paragraphs(raw, cfg);
+        if (!text.length) throw new Error('Nothing to read.');
+        if (cfg.START_PARA > text.length) throw new Error(`start-para must be no greater than the number of paragraphs (${text.length})`);
+        worker = activeWorker = new Worker(cfg);
         const units = preparedUnits(text, cfg, worker);
         if (cfg.OUTPUT_FILE) {
             let previousParagraph = 0;
@@ -693,7 +694,7 @@ async function read(inputFile, cfg) {
         if (saver) saver.abort();
         throw error;
     } finally {
-        if (liveController) liveController.close(); else worker.close();
+        if (liveController) liveController.close(); else worker?.close();
         activeWorker = null;
         liveController = null;
         if (inputFile) process.stdin.destroy();
