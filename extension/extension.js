@@ -108,6 +108,19 @@ function updateStatus(text) {
     if (statusItem && text) statusItem.text = `$(sync~spin) ${text}  $(primitive-square)`;
 }
 
+function appendErrorLog(context, entry) {
+    const line = JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n';
+    const files = [path.join(context.extensionPath, 'logs', 'err.jsonl')];
+    if (context.logUri && context.logUri.fsPath) files.push(path.join(context.logUri.fsPath, 'err.jsonl'));
+    for (const file of files) {
+        try {
+            fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+            fs.appendFileSync(file, line, { encoding: 'utf8', mode: 0o600 });
+            return;
+        } catch (_) {}
+    }
+}
+
 function activate(context) {
     statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
     statusItem.command = 'kokoreader.stop';
@@ -136,13 +149,20 @@ function activate(context) {
             statusItem.hide();
         };
         proc.stderr.on('data', note);
-        proc.on('error', error => { if (activeProc === proc) vscode.window.showErrorMessage(`Kokoreader: ${error.message}`); finish(); });
-        proc.on('exit', code => {
-            if (code && activeProc === proc) {
+        proc.on('error', error => {
+            if (activeProc === proc) {
+                if (config.get('debug')) appendErrorLog(context, { kind: 'reader', event: 'spawn', detail: error.message.slice(0, 1000) });
+                vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
+            }
+            finish();
+        });
+        proc.on('exit', (code, signal) => {
+            if ((code !== 0 || signal) && activeProc === proc) {
                 // Progress is written with \r and the error with no leading newline,
                 // so the two often arrive as one line: "[3/3] synthesizing...Error: …".
                 const at = lastLine.indexOf('Error: ');
-                const detail = at >= 0 ? lastLine.slice(at + 7).trim() : `reader failed (exit ${code})`;
+                const detail = (at >= 0 ? lastLine.slice(at + 7).trim() : signal ? `reader stopped by ${signal}` : `reader failed (exit ${code})`).slice(0, 1000);
+                if (config.get('debug')) appendErrorLog(context, { kind: 'reader', event: 'exit', code, signal: signal || null, detail });
                 vscode.window.showErrorMessage(`Kokoreader: reader failed: ${detail}`);
             }
             finish();
@@ -249,8 +269,16 @@ function activate(context) {
         const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         item.text = `$(sync~spin) Kokoreader: saving ${path.basename(target.fsPath)}...`;
         item.show();
-        process.on('error', error => { item.dispose(); clearSave(); vscode.window.showErrorMessage(`Kokoreader: ${error.message}`); });
-        process.on('exit', code => { item.dispose(); clearSave(); vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (exit ${code})`); });
+        process.on('error', error => {
+            if (activeSave === process && config.get('debug')) appendErrorLog(context, { kind: 'export', event: 'spawn', detail: error.message.slice(0, 1000) });
+            item.dispose(); clearSave(); vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
+        });
+        process.on('exit', (code, signal) => {
+            if (activeSave === process && (code !== 0 || signal) && config.get('debug')) {
+                appendErrorLog(context, { kind: 'export', event: 'exit', code, signal: signal || null, detail: signal ? `export stopped by ${signal}` : `export failed (exit ${code})` });
+            }
+            item.dispose(); clearSave(); vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (${signal || `exit ${code}`})`);
+        });
     });
     context.subscriptions.push(readCommand, cursorCommand, pauseCommand, resumeCommand, previousCommand, replayCommand, nextCommand, stopCommand, saveCommand);
 }

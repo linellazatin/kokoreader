@@ -41,7 +41,7 @@ function extensionHarness(activeEditor, options = {}) {
             executeCommand(...args) { contexts.push(args); },
             registerCommand(name, handler) { commands.set(name, handler); return { dispose() {} }; },
         },
-        workspace: { getConfiguration: () => ({ get: name => ({ pythonPath: '/python', modelDir: '/models', format: 'wav' }[name]) }) },
+        workspace: { getConfiguration: () => ({ get: name => ({ pythonPath: '/python', modelDir: '/models', format: 'wav', debug: false, ...options.configuration }[name]) }) },
         window: {
             activeTextEditor: activeEditor,
             createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
@@ -64,7 +64,11 @@ function extensionHarness(activeEditor, options = {}) {
     };
     try {
         const extension = require(extensionPath);
-        extension.activate({ subscriptions: { push() {} } });
+        extension.activate({
+            subscriptions: { push() {} },
+            extensionPath: options.extensionPath || path.join(ROOT, 'extension'),
+            logUri: uri(options.logPath || path.join(os.tmpdir(), 'kokoreader-test-logs')),
+        });
         return { commands, spawned, contexts, errors, extension, uri };
     } finally {
         Module._load = originalLoad;
@@ -318,7 +322,7 @@ run('extension save command and format setting are format-neutral', () => {
     const save = manifest.contributes.commands.find(command => command.command === 'kokoreader.saveFile');
     assert(save.title.endsWith('Save to File'), `unexpected title: ${save.title}`);
     assert(manifest.contributes.configuration.properties['kokoreader.format'].description.includes('Save to File'), 'format setting does not describe Save to File');
-    assert(source.includes("process.on('error', error => { item.dispose()"), 'save process errors are not handled');
+    assert(source.includes("process.on('error', error => {") && source.includes("kind: 'export'"), 'save process errors are not handled');
 });
 
 run('cursor command reads from the active cursor through document end', () => {
@@ -496,11 +500,57 @@ run('pause cuts the player and resume replays the paragraph from the remembered 
 run('extension reports a failed reader exit and can surface worker errors', () => {
     const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-    assert(/proc\.on\('exit', code =>/.test(source), 'reader exit code is still ignored');
+    assert(/proc\.on\('exit', \(code, signal\) =>/.test(source), 'reader exit code or signal is still ignored');
     assert(source.includes('Kokoreader: reader failed'), 'failed reader exit is not shown to the user');
     assert(source.includes("lastLine.indexOf('Error: ')"), 'error detail is parsed only from the start of a line the progress text shares');
     assert(source.includes("'--debug'"), 'worker debug output cannot be forwarded');
     assert(manifest.contributes.configuration.properties['kokoreader.debug'].order === 17, 'debug setting is not ordered last');
+});
+
+run('debug mode appends reader failures to an extension error log', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-error-log-'));
+    const extensionPath = path.join(dir, 'extension');
+    const activePath = path.join(dir, 'input.md');
+    fs.mkdirSync(extensionPath);
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: activePath, scheme: 'file', toString: () => `file://${activePath}` }, fileName: activePath, getText: () => 'text' },
+    }, { configuration: { debug: true }, extensionPath });
+    try {
+        harness.commands.get('kokoreader.readFile')();
+        const child = harness.spawned[0].child;
+        child.stderr.emit('data', Buffer.from('Error: worker failed'));
+        child.emit('exit', 1);
+        const log = path.join(extensionPath, 'logs', 'err.jsonl');
+        assert(fs.existsSync(log), 'debug reader failure did not create err.jsonl');
+        const entry = JSON.parse(fs.readFileSync(log, 'utf8'));
+        assert(entry.kind === 'reader' && entry.code === 1 && entry.detail === 'worker failed', JSON.stringify(entry));
+    } finally {
+        harness.extension.deactivate();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+run('debug mode appends export failures to an extension error log', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-error-log-'));
+    const extensionPath = path.join(dir, 'extension');
+    const sourcePath = path.join(dir, 'input.md');
+    fs.mkdirSync(extensionPath);
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'text' },
+    }, { configuration: { debug: true }, extensionPath });
+    try {
+        await harness.commands.get('kokoreader.saveFile')();
+        harness.spawned[0].child.emit('exit', 1);
+        const log = path.join(extensionPath, 'logs', 'err.jsonl');
+        assert(fs.existsSync(log), 'debug export failure did not create err.jsonl');
+        const entry = JSON.parse(fs.readFileSync(log, 'utf8'));
+        assert(entry.kind === 'export' && entry.code === 1, JSON.stringify(entry));
+    } finally {
+        harness.extension.deactivate();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 run('relative model paths from a config file resolve against the install directory', () => {
@@ -1054,7 +1104,7 @@ run('previous during synthesis plays only the preceding paragraph', () => {
 run('replay during playback restarts only the current paragraph', () => {
     const paths = stubs({ text: 'First.\n\nSecond.\n' });
     const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
-        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '1000' },
+        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '5000' },
     });
     child.stderr.resume();
     try {
