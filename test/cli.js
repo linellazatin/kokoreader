@@ -33,6 +33,7 @@ function extensionHarness(activeEditor, options = {}) {
     const spawned = [];
     const contexts = [];
     const errors = [];
+    const statusItems = [];
     const uri = file => ({ fsPath: file, scheme: 'file', toString: () => `file://${file}` });
     const vscode = {
         StatusBarAlignment: { Left: 1 },
@@ -44,7 +45,11 @@ function extensionHarness(activeEditor, options = {}) {
         workspace: { getConfiguration: () => ({ get: name => ({ pythonPath: '/python', modelDir: '/models', format: 'wav', debug: false, ...options.configuration }[name]) }) },
         window: {
             activeTextEditor: activeEditor,
-            createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
+            createStatusBarItem: () => {
+                const item = { text: '', show() {}, hide() {}, dispose() {} };
+                statusItems.push(item);
+                return item;
+            },
             showSaveDialog: options.showSaveDialog || (async () => uri('/tmp/kokoreader-output.wav')),
             showErrorMessage(message) { errors.push(message); }, showInformationMessage() {},
         },
@@ -69,7 +74,7 @@ function extensionHarness(activeEditor, options = {}) {
             extensionPath: options.extensionPath || path.join(ROOT, 'extension'),
             logUri: uri(options.logPath || path.join(os.tmpdir(), 'kokoreader-test-logs')),
         });
-        return { commands, spawned, contexts, errors, extension, uri };
+        return { commands, spawned, contexts, errors, statusItems, extension, uri };
     } finally {
         Module._load = originalLoad;
         delete require.cache[extensionPath];
@@ -502,12 +507,12 @@ run('extension reports a failed reader exit and can surface worker errors', () =
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
     assert(/proc\.on\('exit', \(code, signal\) =>/.test(source), 'reader exit code or signal is still ignored');
     assert(source.includes('Kokoreader: reader failed'), 'failed reader exit is not shown to the user');
-    assert(source.includes("lastLine.indexOf('Error: ')"), 'error detail is parsed only from the start of a line the progress text shares');
+    assert(source.includes("error.indexOf('Error: ')"), 'error detail is not parsed from stderr independently of progress');
     assert(source.includes("'--debug'"), 'worker debug output cannot be forwarded');
     assert(manifest.contributes.configuration.properties['kokoreader.debug'].order === 17, 'debug setting is not ordered last');
 });
 
-run('debug mode appends reader failures to an extension error log', () => {
+run('reader failures always append a source-free extension error record', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-error-log-'));
     const extensionPath = path.join(dir, 'extension');
     const activePath = path.join(dir, 'input.md');
@@ -515,23 +520,23 @@ run('debug mode appends reader failures to an extension error log', () => {
     const harness = extensionHarness({
         selection: { isEmpty: true },
         document: { uri: { fsPath: activePath, scheme: 'file', toString: () => `file://${activePath}` }, fileName: activePath, getText: () => 'text' },
-    }, { configuration: { debug: true }, extensionPath });
+    }, { extensionPath });
     try {
         harness.commands.get('kokoreader.readFile')();
         const child = harness.spawned[0].child;
-        child.stderr.emit('data', Buffer.from('Error: worker failed'));
+        child.stderr.emit('data', Buffer.from('Error: worker failed near source text'));
         child.emit('exit', 1);
         const log = path.join(extensionPath, 'logs', 'err.jsonl');
         assert(fs.existsSync(log), 'debug reader failure did not create err.jsonl');
         const entry = JSON.parse(fs.readFileSync(log, 'utf8'));
-        assert(entry.kind === 'reader' && entry.code === 1 && entry.detail === 'worker failed', JSON.stringify(entry));
+        assert(entry.kind === 'reader' && entry.code === 1 && !JSON.stringify(entry).includes('source text'), JSON.stringify(entry));
     } finally {
         harness.extension.deactivate();
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
 
-run('debug mode appends export failures to an extension error log', async () => {
+run('export failures always append an extension error record', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-error-log-'));
     const extensionPath = path.join(dir, 'extension');
     const sourcePath = path.join(dir, 'input.md');
@@ -539,7 +544,7 @@ run('debug mode appends export failures to an extension error log', async () => 
     const harness = extensionHarness({
         selection: { isEmpty: true },
         document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'text' },
-    }, { configuration: { debug: true }, extensionPath });
+    }, { extensionPath });
     try {
         await harness.commands.get('kokoreader.saveFile')();
         harness.spawned[0].child.emit('exit', 1);
@@ -550,6 +555,44 @@ run('debug mode appends export failures to an extension error log', async () => 
     } finally {
         harness.extension.deactivate();
         fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+run('extension error logging falls back when its install directory is unwritable', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-error-log-'));
+    const extensionPath = path.join(dir, 'extension');
+    const logPath = path.join(dir, 'fallback');
+    const activePath = path.join(dir, 'input.md');
+    fs.mkdirSync(extensionPath, { mode: 0o500 });
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: activePath, scheme: 'file', toString: () => `file://${activePath}` }, fileName: activePath, getText: () => 'text' },
+    }, { extensionPath, logPath });
+    try {
+        harness.commands.get('kokoreader.readFile')();
+        harness.spawned[0].child.emit('exit', 1);
+        assert(fs.existsSync(path.join(logPath, 'err.jsonl')), 'unwritable extension directory did not use fallback logging');
+    } finally {
+        harness.extension.deactivate();
+        fs.chmodSync(extensionPath, 0o700);
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+run('debug stderr does not replace playback progress in the status bar', () => {
+    const harness = extensionHarness({
+        selection: { isEmpty: true },
+        document: { uri: { fsPath: '/tmp/kokoreader-debug.md', scheme: 'file', toString: () => 'file:///tmp/kokoreader-debug.md' }, fileName: '/tmp/kokoreader-debug.md', getText: () => 'text' },
+    }, { configuration: { debug: true } });
+    try {
+        harness.commands.get('kokoreader.readFile')();
+        const child = harness.spawned[0].child;
+        child.stderr.emit('data', Buffer.from('\r[1/2] preparing...'));
+        const progress = harness.statusItems[0].text;
+        child.stderr.emit('data', Buffer.from('worker diagnostic detail\n'));
+        assert(harness.statusItems[0].text === progress, `debug stderr replaced progress: ${harness.statusItems[0].text}`);
+    } finally {
+        harness.extension.deactivate();
     }
 });
 
@@ -1103,21 +1146,30 @@ run('previous during synthesis plays only the preceding paragraph', () => {
 
 run('replay during playback restarts only the current paragraph', () => {
     const paths = stubs({ text: 'First.\n\nSecond.\n' });
-    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
-        env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '5000' },
-    });
-    child.stderr.resume();
+    const probe = String.raw`
+const { spawn } = require('child_process');
+const fs = require('fs');
+const cli = process.argv[1]; const paths = JSON.parse(process.argv[2]);
+const events = () => fs.existsSync(paths.events) ? fs.readFileSync(paths.events, 'utf8').split('\n').filter(Boolean).map(JSON.parse) : [];
+const wait = async check => { const end = Date.now() + 8000; while (!check()) { if (Date.now() > end) throw new Error(JSON.stringify(events())); await new Promise(resolve => setTimeout(resolve, 25)); } };
+(async () => {
+  const child = spawn(process.execPath, [cli, '--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices, paths.input], { stdio: ['pipe', 'ignore', 'ignore'] });
+  try {
+    await wait(() => events().some(event => event.tool === 'ffplay'));
+    await new Promise((resolve, reject) => child.stdin.write('replay\n', error => error ? reject(error) : resolve()));
+    await wait(() => events().filter(event => event.tool === 'worker').length >= 2);
+    await wait(() => events().filter(event => event.tool === 'ffplay').length >= 2);
+    const replay = events().map((event, index) => ({ event, index })).filter(({ event }) => event.tool === 'worker')[1].index;
+    if (events().slice(replay + 1).some(event => event.action === 'synthesize' && event.phonemes === 'Second.')) throw new Error(JSON.stringify(events()));
+  } finally { child.kill(); }
+})().then(() => process.exit(0), error => { console.error(error.message); process.exit(1); });
+`;
     try {
-        assert(waitFor(() => stubEvents(paths).some(event => event.tool === 'ffplay')), 'current paragraph did not begin playback');
-        child.stdin.write('replay\n');
-        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'worker').length >= 2), `replay did not replace the worker: ${JSON.stringify(stubEvents(paths))}`);
-        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'ffplay').length >= 2), 'replay did not restart playback');
-        const replayWorker = stubEvents(paths).map((event, index) => ({ event, index }))
-            .filter(({ event }) => event.tool === 'worker')[1].index;
-        assert(!stubEvents(paths).slice(replayWorker + 1).some(event => event.action === 'synthesize' && event.phonemes === 'Second.'),
-            `replay worker synthesized the next paragraph: ${JSON.stringify(stubEvents(paths))}`);
+        const result = spawnSync(process.execPath, ['-e', probe, CLI, JSON.stringify(paths)], {
+            env: { ...process.env, ...stubEnv(paths), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '5000' }, encoding: 'utf8', timeout: 12000,
+        });
+        assert(result.status === 0, `replay failed: ${result.stderr}`);
     } finally {
-        child.kill();
         fs.rmSync(paths.dir, { recursive: true, force: true });
     }
 });

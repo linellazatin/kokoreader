@@ -57,7 +57,7 @@
         "kokoreader.sampleRate": { "type": "number", "order": 14, "minimum": 0, "default": 0, "description": "Saved-audio sample rate in Hz. Set 0 to preserve Kokoro's source rate." },
         "kokoreader.normalize": { "type": "boolean", "order": 15, "default": false, "description": "Apply EBU R128 loudness normalization." },
         "kokoreader.limiter": { "type": "boolean", "order": 16, "default": true, "description": "Limit output peaks to prevent clipping." },
-        "kokoreader.debug": { "type": "boolean", "order": 17, "default": false, "description": "Show worker errors and append failed extension reads or exports to err.jsonl." },
+        "kokoreader.debug": { "type": "boolean", "order": 17, "default": false, "description": "Show worker errors without replacing playback progress." },
         "kokoreader.threads": { "type": "number", "order": 18, "minimum": 0, "default": 0, "description": "ONNX Runtime thread cap. Set 0 for automatic selection." },
         "kokoreader.pronunciationsPath": { "type": "string", "order": 19, "default": "", "description": "Local JSON object mapping literal source phrases to spoken replacements." }
       }

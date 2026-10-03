@@ -131,10 +131,13 @@ function activate(context) {
     function startReading(config, file, status, temporary = null) {
         updateStatus(status);
         const proc = spawnCli([...configArgs(config), file], { stdio: ['pipe', 'ignore', 'pipe'] });
-        let lastLine = '';
+        let lastError = '';
         const note = chunk => {
-            const lines = chunk.toString().replace(/\r/g, '\n').trim().split('\n').filter(Boolean);
-            if (lines.length) { lastLine = lines[lines.length - 1]; updateStatus(lastLine); }
+            const lines = chunk.toString().replace(/\r/g, '\n').split('\n').map(line => line.trim()).filter(Boolean);
+            const error = lines.find(line => line.includes('Error: '));
+            if (error) lastError = error.slice(error.indexOf('Error: ') + 7).trim();
+            const statusLine = lines.filter(line => /^\[\d+\/\d+\] (preparing|synthesizing|playing)\.\.\.\s*$/.test(line) || line.startsWith('Kokoreader: ')).at(-1);
+            if (statusLine) updateStatus(statusLine);
         };
         activeProc = proc;
         activeTemporary = temporary;
@@ -151,7 +154,7 @@ function activate(context) {
         proc.stderr.on('data', note);
         proc.on('error', error => {
             if (activeProc === proc) {
-                if (config.get('debug')) appendErrorLog(context, { kind: 'reader', event: 'spawn', detail: error.message.slice(0, 1000) });
+                appendErrorLog(context, { kind: 'reader', event: 'spawn', detail: 'reader process failed to start' });
                 vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
             }
             finish();
@@ -160,9 +163,8 @@ function activate(context) {
             if ((code !== 0 || signal) && activeProc === proc) {
                 // Progress is written with \r and the error with no leading newline,
                 // so the two often arrive as one line: "[3/3] synthesizing...Error: …".
-                const at = lastLine.indexOf('Error: ');
-                const detail = (at >= 0 ? lastLine.slice(at + 7).trim() : signal ? `reader stopped by ${signal}` : `reader failed (exit ${code})`).slice(0, 1000);
-                if (config.get('debug')) appendErrorLog(context, { kind: 'reader', event: 'exit', code, signal: signal || null, detail });
+                const detail = (lastError || (signal ? `reader stopped by ${signal}` : `reader failed (exit ${code})`)).slice(0, 1000);
+                appendErrorLog(context, { kind: 'reader', event: 'exit', code, signal: signal || null, detail: signal ? `reader stopped by ${signal}` : `reader failed (exit ${code})` });
                 vscode.window.showErrorMessage(`Kokoreader: reader failed: ${detail}`);
             }
             finish();
@@ -270,11 +272,11 @@ function activate(context) {
         item.text = `$(sync~spin) Kokoreader: saving ${path.basename(target.fsPath)}...`;
         item.show();
         process.on('error', error => {
-            if (activeSave === process && config.get('debug')) appendErrorLog(context, { kind: 'export', event: 'spawn', detail: error.message.slice(0, 1000) });
+            if (activeSave === process) appendErrorLog(context, { kind: 'export', event: 'spawn', detail: 'export process failed to start' });
             item.dispose(); clearSave(); vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
         });
         process.on('exit', (code, signal) => {
-            if (activeSave === process && (code !== 0 || signal) && config.get('debug')) {
+            if (activeSave === process && (code !== 0 || signal)) {
                 appendErrorLog(context, { kind: 'export', event: 'exit', code, signal: signal || null, detail: signal ? `export stopped by ${signal}` : `export failed (exit ${code})` });
             }
             item.dispose(); clearSave(); vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (${signal || `exit ${code}`})`);
