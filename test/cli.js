@@ -6,6 +6,7 @@ const fs = require('fs');
 const Module = require('module');
 const os = require('os');
 const path = require('path');
+const vm = require('vm');
 
 const ROOT = path.resolve(__dirname, '..');
 const CLI = path.join(ROOT, 'bin', 'kokoreader.js');
@@ -229,6 +230,17 @@ const wait = async check => {
         encoding: 'utf8', timeout: 15000, env: { ...process.env, ...stubEnv(paths), ...env },
     });
     assert(result.status === 0, `live probe failed: ${result.stderr}`);
+}
+
+function playbackHarness(play) {
+    const source = fs.readFileSync(CLI, 'utf8');
+    const entry = source.lastIndexOf('\nmain().catch(');
+    assert(entry > 0, 'CLI entry point not found');
+    const context = { require, Buffer, setTimeout, clearTimeout, __dirname: path.dirname(CLI),
+        module: { exports: {} }, process: { env: {}, on() {}, stderr: { write() {} } }, play };
+    // Test the real controller with only its audio boundary replaced; no shipped test API.
+    vm.runInNewContext(source.slice(0, entry) + '\nplayPCM = play; module.exports = { PlaybackController };', context, { filename: CLI });
+    return context.module.exports.PlaybackController;
 }
 
 run('--help describes the Kokoro reader CLI', () => {
@@ -1373,6 +1385,110 @@ run('same-paragraph prefetch failure exits even while playback is paused', () =>
     assert(exited.code === 1 && stderr.includes('stub synthesis failed'), 'paused lookahead error was not surfaced');
     assert(!players().some(player => alive(player.pid)), 'paused lookahead error left a player alive');
     assert(syntheses().length === 2, 'paused lookahead error launched further work');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('live playback retains only active and successor preparation across long documents', async () => {
+    for (const unitCount of [1, 3]) {
+        const text = Array.from({ length: 48 }, (_, index) => `paragraph-${index}`);
+        const played = [], synthesized = [], samples = [];
+        let controller;
+        const sample = () => samples.push({ index: controller.index, keys: [...controller.prefetched.keys()] });
+        const PlaybackController = playbackHarness(async pcm => { sample(); played.push(pcm.toString()); });
+        const worker = {
+            async prepare(paragraph) { sample(); return Array.from({ length: unitCount }, (_, index) => `${paragraph}-unit-${index}`); },
+            async synthesize(phonemes) { synthesized.push(phonemes); return { pcm: Buffer.from(phonemes), sampleRate: 24000 }; },
+            async close() {},
+        };
+        controller = new PlaybackController(text, worker, { START_PARA: 1 });
+        controller.waitForParagraphGap = async () => {};
+        try {
+            await controller.run();
+            const expected = text.flatMap(paragraph => Array.from({ length: unitCount }, (_, index) => `${paragraph}-unit-${index}`));
+            assert(JSON.stringify(played) === JSON.stringify(expected), 'eviction changed or skipped played units');
+            assert(JSON.stringify(synthesized) === JSON.stringify(expected), 'eviction duplicated or skipped synthesis');
+            assert(samples.every(sample => sample.keys.length <= 2 && sample.keys.every(key => key >= sample.index && key <= sample.index + 1)),
+                `completed preparation accumulated: maximum retained ${Math.max(...samples.map(sample => sample.keys.length))}`);
+            assert(controller.prefetched.size === 0, 'final paragraph preparation was not evicted');
+        } finally { controller.close(); }
+    }
+});
+
+run('live playback releases consumed first-unit PCM from cached preparation', async () => {
+    let controller;
+    const retained = [];
+    const PlaybackController = playbackHarness(async () => {
+        const prepared = await controller.prefetched.get(controller.index);
+        retained.push(prepared.audio);
+    });
+    const worker = {
+        async prepare() { return ['one', 'two', 'three']; },
+        async synthesize() { return { pcm: Buffer.alloc(1024), sampleRate: 24000 }; },
+        async close() {},
+    };
+    controller = new PlaybackController(['One.'], worker, { START_PARA: 1 });
+    try {
+        await controller.run();
+        assert(retained.length === 3 && retained.every(audio => audio === null), 'cached preparation retained the consumed first-unit PCM');
+    } finally { controller.close(); }
+});
+
+run('failed lookahead immediately releases cached paragraph preparation', async () => {
+    const PlaybackController = playbackHarness(async () => {});
+    const worker = {
+        async prepare() { return ['one', 'two']; },
+        async synthesize(phonemes) { if (phonemes === 'two') throw new Error('planned successor failure'); return { pcm: Buffer.alloc(1024), sampleRate: 24000 }; },
+        async close() {},
+    };
+    const controller = new PlaybackController(['One.'], worker, { START_PARA: 1 });
+    try {
+        let failure;
+        try { await controller.run(); } catch (error) { failure = error; }
+        assert(failure?.message === 'planned successor failure', 'lookahead failure was not surfaced');
+        assert(controller.prefetched.size === 0, 'failed lookahead retained cached preparation');
+    } finally { controller.close(); }
+});
+
+run('controller close releases completed and outstanding paragraph preparation', async () => {
+    const PlaybackController = playbackHarness(async () => {});
+    let finishPrepare, markStarted;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    const worker = {
+        async prepare(text) { if (text === 'Two.') { markStarted(); return new Promise(resolve => { finishPrepare = resolve; }); } return [text]; },
+        async synthesize() { return { pcm: Buffer.alloc(1024), sampleRate: 24000 }; },
+        async close() {},
+    };
+    const controller = new PlaybackController(['One.', 'Two.'], worker, { START_PARA: 1 });
+    await controller.prepareParagraph(0, controller.generation);
+    const pending = controller.prepareParagraph(1, controller.generation, true);
+    try {
+        await started;
+        controller.close();
+        assert(controller.prefetched.size === 0, 'close retained completed or outstanding preparation');
+    } finally {
+        finishPrepare(['Two.']);
+        await pending;
+        controller.close();
+    }
+    assert(controller.prefetched.size === 0, 'settled preparation was reinserted after close');
+});
+
+run('previous after forward eviction prepares and plays the preceding paragraph again', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const first = Buffer.alloc(8, 1).toString('base64');
+    try {
+        liveProbe(paths, { KKR_STUB_PCM_BY_PHONEME: JSON.stringify({ 'First.': first, 'Second.': Buffer.alloc(8, 2).toString('base64') }),
+            KKR_STUB_FFPLAY_HOLD_MS: '500' }, `
+    await wait(() => players().length === 2);
+    child.stdin.write('previous\\n');
+    await wait(() => events().filter(event => event.tool === 'ffplay-input' && event.pcm === '${first}').length === 2);
+    const prepared = events().filter(event => !event.tool && event.action === 'prepare' && event.text === 'First.');
+    assert(prepared.length === 2, 'Previous reused or lost evicted preparation');
+    assert(syntheses().filter(event => event.phonemes === 'First.').length === 2, 'Previous skipped or duplicated the new synthesis');
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+    assert(exited.code === 0, 'Stop failed');
 `);
     } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
 });

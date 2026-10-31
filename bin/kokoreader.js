@@ -635,6 +635,7 @@ class PlaybackController {
         this.workerClosing = Promise.resolve(); this.cancelGap = null;
     }
     cancelWorker() {
+        this.prefetched.clear();
         const worker = this.worker;
         this.worker = null;
         if (activeWorker === worker) activeWorker = null;
@@ -712,6 +713,7 @@ class PlaybackController {
             catch (error) { if (generation !== this.generation) continue; throw error; }
             if (!prepared || generation !== this.generation) continue;
             let audio = prepared.audio;
+            prepared.audio = null;
             for (let unit = 0; unit < prepared.units.length; unit++) {
                 if (!await this.waitForPlayback(generation)) break;
                 process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] synthesizing...`);
@@ -742,6 +744,7 @@ class PlaybackController {
                 if (generation !== this.generation) break;
             }
             if (generation !== this.generation) continue;
+            this.prefetched.delete(paragraph);
             this.index++;
             if (this.index < this.text.length) await this.waitForParagraphGap();
         }
