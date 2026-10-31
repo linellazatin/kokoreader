@@ -1879,6 +1879,23 @@ run('worker language warnings reach the user once per distinct message', () => {
     fs.rmSync(paths.dir, { recursive: true, force: true });
 });
 
+run('voice-language mismatch warnings reach CLI once and editor status without failing', () => {
+    const paths = stubs();
+    const warning = 'voice "af_aoede" prefix suggests --lang en-us, but --lang es was selected; this experimental pairing may sound incorrect';
+    try {
+        const result = cli([...cliArgs(paths), '--lang', 'es', paths.input], { env: { ...stubEnv(paths), KKR_STUB_WARNING: warning } });
+        assert(result.status === 0 && result.stderr.split(warning).length === 2, 'mismatch warning was lost, repeated, or made fatal');
+        const sourcePath = '/tmp/kokoreader-voice-warning.md';
+        const harness = extensionHarness({ selection: { isEmpty: true },
+            document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'text' } });
+        try {
+            harness.commands.get('kokoreader.readFile')();
+            harness.spawned[0].child.stderr.emit('data', Buffer.from(`Kokoreader: ${warning}\n`));
+            assert(harness.statusItems[0].text.includes(warning) && harness.errors.length === 0, 'editor did not surface the nonfatal mismatch warning');
+        } finally { harness.extension.deactivate(); }
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
 run('--list-languages maps voice initials to codes and lists what espeak-ng accepts', () => {
     for (const flag of ['--list-languages', '-ll']) {
         const paths = stubs();
