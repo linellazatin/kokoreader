@@ -34,6 +34,7 @@ function extensionHarness(activeEditor, options = {}) {
     const spawned = [];
     const contexts = [];
     const errors = [];
+    const information = [];
     const statusItems = [];
     const uri = file => ({ fsPath: file, scheme: 'file', toString: () => `file://${file}` });
     const vscode = {
@@ -52,7 +53,7 @@ function extensionHarness(activeEditor, options = {}) {
                 return item;
             },
             showSaveDialog: options.showSaveDialog || (async () => uri('/tmp/kokoreader-output.wav')),
-            showErrorMessage(message) { errors.push(message); }, showInformationMessage() {},
+            showErrorMessage(message) { errors.push(message); }, showInformationMessage(message) { information.push(message); },
         },
     };
     const originalLoad = Module._load;
@@ -62,7 +63,10 @@ function extensionHarness(activeEditor, options = {}) {
         if (request === 'vscode') return vscode;
         if (request === 'child_process') return { spawn: (command, args, options) => {
             const child = new EventEmitter();
-            child.stdin = { write() {} }; child.stderr = new EventEmitter(); child.kill = () => {};
+            child.stdin = new EventEmitter(); child.stdin.writes = [];
+            child.stdin.write = text => { child.stdin.writes.push(text); };
+            child.stderr = new EventEmitter(); child.kills = [];
+            child.kill = signal => { child.kills.push(signal); child.emit('close', null, signal || 'SIGTERM'); return true; };
             spawned.push({ command, args, options, child });
             return child;
         } };
@@ -75,7 +79,7 @@ function extensionHarness(activeEditor, options = {}) {
             extensionPath: options.extensionPath || path.join(ROOT, 'extension'),
             logUri: uri(options.logPath || path.join(os.tmpdir(), 'kokoreader-test-logs')),
         });
-        return { commands, spawned, contexts, errors, statusItems, extension, uri };
+        return { commands, spawned, contexts, errors, information, statusItems, extension, uri };
     } finally {
         Module._load = originalLoad;
         delete require.cache[extensionPath];
@@ -146,11 +150,17 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
 `);
     fs.writeFileSync(path.join(paths.tools, 'ffmpeg'), `#!/usr/bin/env node
 const fs = require('fs');
-fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffmpeg', args: process.argv.slice(2) }) + '\\n');
+fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffmpeg', pid: process.pid, args: process.argv.slice(2) }) + '\\n');
 const out = process.argv[process.argv.length - 1];
 const sink = /^pipe:/.test(out) ? null : out;
+if (sink && process.env.KKR_STUB_ENCODER_IGNORE_TERM) process.on('SIGTERM', () => {});
+if (sink && process.env.KKR_STUB_ENCODER_TERM_SUCCESS) process.on('SIGTERM', () => process.exit(0));
 process.stdin.on('data', chunk => { if (sink) fs.appendFileSync(sink, chunk); else process.stdout.write(chunk); });
-process.stdin.on('end', () => process.exit(0));
+process.stdin.on('end', () => {
+  fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffmpeg-end', pid: process.pid }) + '\\n');
+  const hold = sink && Number(process.env.KKR_STUB_ENCODER_HOLD_MS || 0);
+  hold ? setTimeout(() => process.exit(0), hold) : process.exit(0);
+});
 `);
     fs.writeFileSync(path.join(paths.tools, 'ffplay'), `#!/usr/bin/env node
 const fs = require('fs');
@@ -200,7 +210,7 @@ function cliArgs(paths) {
     return ['--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices];
 }
 
-function liveProbe(paths, env, scenario) {
+function liveProbe(paths, env, scenario, args = []) {
     const probe = `
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -216,7 +226,7 @@ const wait = async check => {
   while (!check()) { if (Date.now() >= deadline) throw new Error('condition timed out'); await sleep(25); }
 };
 (async () => {
-  const child = spawn(process.execPath, [process.argv[1], '--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices, paths.input], { stdio: ['pipe', 'ignore', 'pipe'] });
+  const child = spawn(process.execPath, [process.argv[1], '--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices, ...JSON.parse(process.argv[3]), paths.input], { stdio: ['pipe', 'ignore', 'pipe'] });
   let exited = null, stderr = '';
   child.on('exit', (code, signal) => { exited = { code, signal }; });
   child.stderr.on('data', chunk => { stderr += chunk; });
@@ -226,7 +236,7 @@ const wait = async check => {
   finally { child.kill(); await wait(() => exited); }
 })().then(() => process.exit(0), error => { console.error(error.message); process.exit(1); });
 `;
-    const result = spawnSync(process.execPath, ['-e', probe, CLI, JSON.stringify(paths)], {
+    const result = spawnSync(process.execPath, ['-e', probe, CLI, JSON.stringify(paths), JSON.stringify(args)], {
         encoding: 'utf8', timeout: 15000, env: { ...process.env, ...stubEnv(paths), ...env },
     });
     assert(result.status === 0, `live probe failed: ${result.stderr}`);
@@ -627,7 +637,7 @@ run('export failures always append an extension error record', async () => {
     }, { extensionPath });
     try {
         await harness.commands.get('kokoreader.saveFile')();
-        harness.spawned[0].child.emit('exit', 1);
+        harness.spawned[0].child.emit('close', 1);
         const log = path.join(extensionPath, 'logs', 'err.jsonl');
         assert(fs.existsSync(log), 'debug export failure did not create err.jsonl');
         const entry = JSON.parse(fs.readFileSync(log, 'utf8'));
@@ -920,7 +930,7 @@ run('extension saves current editor text through private temporary input', () =>
     assert(source.includes('function inputForEditor('), 'extension has no shared editor-input resolver');
     assert(source.includes('editor.document.getText(editor.selection)'), 'Save to File cannot use an active selection');
     assert(source.includes('editor.document.getText()'), 'Save to File cannot use unsaved editor content');
-    assert(source.includes('activeSaveTemporary'), 'Save to File temporary input is not lifecycle-managed');
+    assert(source.includes('cleanupTemporary(input.temporary)'), 'Save to File temporary input is not lifecycle-managed');
 });
 
 run('extension Read honors a context-menu target over another active editor', () => {
@@ -971,6 +981,81 @@ run('extension commands cannot replace an active export through the Command Pale
     harness.commands.get('kokoreader.readFromCursor')();
     harness.extension.deactivate();
     assert(harness.spawned.length === 1, `commands replaced export with ${harness.spawned.length} processes`);
+});
+
+run('export Stop retains ownership until close and suppresses cancellation notifications', async () => {
+    const sourcePath = '/tmp/kokoreader-export-stop.md';
+    const harness = extensionHarness({ selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'unsaved text' } });
+    try {
+        await harness.commands.get('kokoreader.saveFile')();
+        const call = harness.spawned[0];
+        const input = call.args.at(-1);
+        const saving = () => harness.contexts.filter(args => args[1] === 'kokoreader.isSaving').at(-1)[2];
+        const stopped = harness.commands.get('kokoreader.stop')();
+        assert(Array.isArray(call.options.stdio) && call.options.stdio[0] === 'pipe', 'export has no cooperative stdin');
+        assert(call.child.stdin.writes.includes('stop\n') && call.child.kills.length === 0, 'Stop killed instead of requesting cleanup');
+        assert(fs.existsSync(input) && saving(), 'Stop released input or saving ownership before process close');
+        await harness.commands.get('kokoreader.saveFile')();
+        harness.commands.get('kokoreader.readFile')();
+        assert(harness.spawned.length === 1, 'new work overlapped the closing export');
+        harness.information.length = 0;
+        call.child.emit('exit', 0);
+        assert(fs.existsSync(input) && saving(), 'exit released ownership before stream closure');
+        call.child.emit('close', 0);
+        await stopped;
+        assert(!fs.existsSync(input) && !saving(), 'close did not release operation-owned input and saving state');
+        assert(harness.information.length === 0 && harness.errors.length === 0, 'cancelled export reported success or failure');
+        await harness.commands.get('kokoreader.saveFile')();
+        assert(harness.spawned.length === 2, 'new export could not start after cleanup');
+        harness.spawned[1].child.emit('close', 0);
+    } finally { await harness.extension.deactivate(); }
+});
+
+run('export Stop reaps worker and encoder and preserves prior output at every stage', () => {
+    for (const stage of ['startup', 'synthesis', 'encoding', 'encoding-success-exit', 'encoding-ignore-term']) {
+        const paths = stubs({ text: 'One paragraph.\n' });
+        const output = path.join(paths.dir, 'saved.wav');
+        fs.writeFileSync(output, 'previous output');
+        try {
+            const env = stage === 'startup' ? { KKR_STUB_READY_DELAY: '5000' } : stage === 'synthesis' ?
+                { KKR_STUB_SYNTH_DELAY: '700' } : { KKR_STUB_ENCODER_HOLD_MS: '10000',
+                    ...(stage === 'encoding-success-exit' ? { KKR_STUB_ENCODER_TERM_SUCCESS: '1' } : {}),
+                    ...(stage === 'encoding-ignore-term' ? { KKR_STUB_ENCODER_IGNORE_TERM: '1' } : {}) };
+            const reached = stage === 'startup' ? 'events().some(event => event.tool === "worker")' : stage === 'synthesis' ?
+                'syntheses().length === 1' : 'events().some(event => event.tool === "ffmpeg-end")';
+            liveProbe(paths, env, `
+    await wait(() => ${reached});
+    const pids = events().filter(event => event.tool === 'worker' || event.tool === 'ffmpeg').map(event => event.pid);
+    child.stdin.write('stop\\n');
+    await wait(() => exited && pids.every(pid => !alive(pid)));
+    assert(exited.code === 0, 'Stop did not exit successfully');
+    await sleep(200);
+    assert(fs.readFileSync(${JSON.stringify(output)}, 'utf8') === 'previous output', 'cancelled export replaced prior output');
+    assert(!fs.existsSync(${JSON.stringify(output + '.part')}), 'cancelled export left a partial file');
+`, ['--output', output]);
+        } finally {
+            for (const event of stubEvents(paths)) if (event.pid) { try { process.kill(event.pid, 'SIGKILL'); } catch (_) {} }
+            fs.rmSync(paths.dir, { recursive: true, force: true });
+        }
+    }
+});
+
+run('export deactivation waits for close and uses a bounded hard-kill fallback', async () => {
+    const sourcePath = '/tmp/kokoreader-export-deactivate.md';
+    const harness = extensionHarness({ selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'text' } });
+    await harness.commands.get('kokoreader.saveFile')();
+    const call = harness.spawned[0], input = call.args.at(-1);
+    const before = Date.now();
+    const stopped = harness.extension.deactivate();
+    assert(stopped && typeof stopped.then === 'function', 'deactivate did not return a cleanup promise');
+    assert(fs.existsSync(input) && call.child.kills.length === 0, 'deactivate released ownership before cooperative cleanup');
+    await stopped;
+    assert(call.child.kills.length === 1 && call.child.kills[0] === 'SIGKILL', 'unresponsive export did not receive one hard-kill fallback');
+    assert(Date.now() - before < 4500, 'fallback cleanup was not bounded');
+    assert(!fs.existsSync(input), 'deactivation did not remove private input after close');
+    assert(harness.errors.length === 0 && harness.information.length === 0, 'deactivation reported a user cancellation as success or failure');
 });
 
 run('extension clears saving state when the Save dialog rejects', async () => {

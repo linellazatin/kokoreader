@@ -8,7 +8,7 @@ const path = require('path');
 
 let activeProc = null;
 let activeSave = null;
-let activeSaveTemporary = null;
+let cancelSave = null;
 let pendingSave = false;
 let saveGeneration = 0;
 let statusItem = null;
@@ -86,13 +86,11 @@ function spawnCli(args, options) {
 function stop() {
     paused = false;
     setState(false, false);
-    const saveTemporary = activeSaveTemporary;
-    activeSaveTemporary = null;
     pendingSave = false;
     saveGeneration++;
-    if (activeSave) { try { activeSave.kill(); } catch (_) {} activeSave = null; }
-    setSaving(false);
-    cleanupTemporary(saveTemporary);
+    let saveClosed = Promise.resolve();
+    if (activeSave) saveClosed = cancelSave();
+    else setSaving(false);
     const reader = activeProc;
     const temporary = activeTemporary;
     activeProc = null;
@@ -103,6 +101,7 @@ function stop() {
     }
     if (statusItem) statusItem.hide();
     cleanupTemporary(temporary);
+    return saveClosed;
 }
 
 function updateStatus(text) {
@@ -259,38 +258,53 @@ function activate(context) {
             setSaving(false);
             return vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
         }
-        const process = spawnCli([...configArgs(config), '--output', target.fsPath, input.file], { stdio: 'ignore' });
+        const process = spawnCli([...configArgs(config), '--output', target.fsPath, input.file], { stdio: ['pipe', 'ignore', 'ignore'] });
+        process.stdin.on('error', () => {});
         activeSave = process;
-        activeSaveTemporary = input.temporary;
         setSaving(true);
-        let cleaned = false;
+        let cleaned = false, cancelled = false, processError = false, killTimer = null, resolveClosed;
+        const closed = new Promise(resolve => { resolveClosed = resolve; });
+        cancelSave = () => {
+            if (!cancelled) {
+                cancelled = true;
+                try { process.stdin.write('stop\n'); } catch (_) {}
+                killTimer = setTimeout(() => { try { process.kill('SIGKILL'); } catch (_) {} }, 2500);
+            }
+            return closed;
+        };
         const clearSave = () => {
             if (cleaned) return;
             cleaned = true;
+            clearTimeout(killTimer);
             cleanupTemporary(input.temporary);
             if (activeSave === process) {
                 activeSave = null;
-                activeSaveTemporary = null;
+                cancelSave = null;
                 setSaving(false);
             }
+            resolveClosed();
         };
         const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         item.text = `$(sync~spin) Kokoreader: saving ${path.basename(target.fsPath)}...`;
         item.show();
         process.on('error', error => {
-            if (activeSave === process) appendErrorLog(context, { kind: 'export', event: 'spawn', detail: 'export process failed to start' });
-            item.dispose(); clearSave(); vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
-        });
-        process.on('exit', (code, signal) => {
-            if (activeSave === process && (code !== 0 || signal)) {
-                appendErrorLog(context, { kind: 'export', event: 'exit', code, signal: signal || null, detail: signal ? `export stopped by ${signal}` : `export failed (exit ${code})` });
+            processError = true;
+            if (!cancelled && activeSave === process) {
+                appendErrorLog(context, { kind: 'export', event: 'spawn', detail: 'export process failed to start' });
+                vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
             }
-            item.dispose(); clearSave(); vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (${signal || `exit ${code}`})`);
+        });
+        process.on('close', (code, signal) => {
+            if (!cancelled && !processError && activeSave === process) {
+                if (code !== 0 || signal) appendErrorLog(context, { kind: 'export', event: 'exit', code, signal: signal || null, detail: signal ? `export stopped by ${signal}` : `export failed (exit ${code})` });
+                vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (${signal || `exit ${code}`})`);
+            }
+            item.dispose(); clearSave();
         });
     });
     context.subscriptions.push(readCommand, cursorCommand, pauseCommand, resumeCommand, previousCommand, replayCommand, nextCommand, stopCommand, saveCommand);
 }
 
-function deactivate() { stop(); }
+function deactivate() { return stop(); }
 
 module.exports = { activate, deactivate };

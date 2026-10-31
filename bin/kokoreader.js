@@ -470,6 +470,9 @@ let activeFfmpeg = null;
 let activeFfplay = null;
 let activeWorker = null;
 let activePartFile = null;
+let activeEncoder = null;
+let stopping = false;
+let cleanupPromise = null;
 let playbackPaused = false;
 let liveController = null;
 let playbackCancelled = false;
@@ -479,22 +482,31 @@ let activePause = null;
 const onResume = new Set();
 
 function killActive() {
-    for (const child of [activeWorker && activeWorker.proc, activeFfmpeg, activeFfplay]) {
-        try { child && child.kill(); } catch (_) {}
+    if (cleanupPromise) return cleanupPromise;
+    stopping = true;
+    playbackCancelled = true;
+    const worker = activeWorker;
+    const encoder = activeEncoder;
+    if (liveController) { liveController.generation++; liveController.close(); }
+    const closing = [worker?.close(), encoder?.abort()];
+    for (const child of [activeFfmpeg, activeFfplay]) {
+        try { child?.kill(); } catch (_) {}
     }
     activeFfmpeg = activeFfplay = activeWorker = null;
     activePause = null;
     onResume.clear();
     playbackPaused = false;
-    // process.exit skips read()'s finally, so the in-flight encoder's temporary
-    // file has to be reaped here or Ctrl-C and Stop litter the user's folder.
-    if (activePartFile) { try { fs.unlinkSync(activePartFile); } catch (_) {} activePartFile = null; }
+    // Wait for owned file handles to close before removing encoder output.
+    cleanupPromise = Promise.race([Promise.allSettled(closing), delay(WORKER_SHUTDOWN_MS + 500)]).then(() => {
+        if (activePartFile) { try { fs.unlinkSync(activePartFile); } catch (_) {} activePartFile = null; }
+    });
+    return cleanupPromise;
 }
 
 // A signal that bypasses the stdin 'stop' line (editor reload, Ctrl-C, the
 // extension's fallback kill) must still reap the resident worker and player.
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-    process.on(signal, () => { killActive(); process.exit(128); });
+    process.on(signal, () => { killActive().then(() => process.exit(128)); });
 }
 
 function pausePlayback() {
@@ -514,7 +526,7 @@ function setupIPC() {
         if (line.trim() === 'pause') pausePlayback();
         if (line.trim() === 'resume') resumePlayback();
         if (['previous', 'replay', 'next'].includes(line.trim()) && liveController) liveController.navigate(line.trim());
-        if (line.trim() === 'stop') { killActive(); process.exit(0); }
+        if (line.trim() === 'stop') killActive().then(() => process.exit(0));
     });
 }
 
@@ -593,11 +605,21 @@ function startSaveEncoder(cfg, sampleRate) {
     const args = ['-y', '-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg)];
     if (cfg.SAMPLE_RATE) args.push('-ar', String(cfg.SAMPLE_RATE));
     args.push('-f', cfg.FORMAT, temporary);
-    const ffmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'ignore'] });
+    const ffmpeg = activeFfmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'ignore'] });
     ffmpeg.stdin.on('error', () => {});
+    let cancelled = false, exited = false, killTimer = null;
+    const closed = new Promise(resolve => ffmpeg.once('close', () => {
+        exited = true;
+        clearTimeout(killTimer);
+        if (activeFfmpeg === ffmpeg) activeFfmpeg = null;
+        if (activeEncoder?.stdin === ffmpeg.stdin) activeEncoder = null;
+        resolve();
+    }));
+    ffmpeg.once('spawn', () => { if (cancelled) { try { ffmpeg.kill(); } catch (_) {} } });
     const done = new Promise((resolve, reject) => {
         ffmpeg.on('error', reject);
-        ffmpeg.on('exit', code => {
+        ffmpeg.on('close', code => {
+            if (cancelled) return reject(new Error('Audio export cancelled'));
             if (code !== 0) return reject(new Error(`ffmpeg exited with code ${code}`));
             if (!fs.existsSync(temporary)) return reject(new Error(`ffmpeg produced no audio for ${cfg.OUTPUT_FILE}`));
             try { fs.renameSync(temporary, cfg.OUTPUT_FILE); if (activePartFile === temporary) activePartFile = null; resolve(); }
@@ -607,10 +629,15 @@ function startSaveEncoder(cfg, sampleRate) {
     // Publish atomically: a failed read must leave the previous file alone, and
     // the killed encoder must not leave a stray .part behind.
     done.catch(() => { try { fs.unlinkSync(temporary); } catch (_) {} });
-    return {
+    return activeEncoder = {
         stdin: ffmpeg.stdin,
         done,
-        abort() { try { ffmpeg.stdin.destroy(); ffmpeg.kill(); } catch (_) {} },
+        abort() {
+            cancelled = true;
+            try { ffmpeg.stdin.destroy(); ffmpeg.kill(); } catch (_) {}
+            if (!exited && !killTimer) killTimer = setTimeout(() => { try { ffmpeg.kill('SIGKILL'); } catch (_) {} }, WORKER_SHUTDOWN_MS);
+            return closed;
+        },
     };
 }
 
@@ -653,7 +680,7 @@ class PlaybackController {
     }
     async ensureWorker(generation) {
         await this.workerClosing;
-        if (generation !== undefined && generation !== this.generation) return null;
+        if (stopping || (generation !== undefined && generation !== this.generation)) return null;
         if (!this.worker) this.worker = activeWorker = new Worker(this.cfg);
         return this.worker;
     }
@@ -703,7 +730,7 @@ class PlaybackController {
         }
     }
     async run() {
-        while (this.index < this.text.length) {
+        while (this.index < this.text.length && !stopping) {
             if (this.fatal) throw this.fatal;
             const generation = this.generation;
             const paragraph = this.index;
@@ -781,6 +808,7 @@ async function read(inputFile, cfg) {
             for await (const unit of units) {
                 process.stderr.write(`\r[${unit.paragraph}/${unit.total}] synthesizing...`);
                 const result = await worker.synthesize(unit.phonemes, cfg);
+                if (stopping) break;
                 if (!saver) saver = startSaveEncoder(cfg, result.sampleRate);
                 if (previousParagraph && unit.paragraph !== previousParagraph) {
                     const bytes = Math.round(result.sampleRate * 2 * cfg.TEMPO * PARAGRAPH_PAUSE_MS / 1000);
@@ -798,10 +826,10 @@ async function read(inputFile, cfg) {
         if (saver) { saver.stdin.end(); await saver.done; }
         process.stderr.write('\n');
     } catch (error) {
-        if (saver) saver.abort();
-        throw error;
+        if (saver) await saver.abort();
+        if (!stopping) throw error;
     } finally {
-        if (liveController) liveController.close(); else worker?.close();
+        if (liveController) { liveController.close(); await liveController.workerClosing; } else await worker?.close();
         activeWorker = null;
         liveController = null;
         if (inputFile) process.stdin.destroy();
@@ -911,4 +939,4 @@ async function main() {
     await read(parsed.inputFile, cfg);
 }
 
-main().catch(error => { process.stderr.write(`Error: ${error.message}\n`); process.exitCode = 1; });
+main().catch(error => { if (!stopping) { process.stderr.write(`Error: ${error.message}\n`); process.exitCode = 1; } });
