@@ -117,6 +117,7 @@ const events = ${JSON.stringify(paths.events)};
 const delay = Number(process.env.KKR_STUB_SYNTH_DELAY || 0);
 fs.appendFileSync(events, JSON.stringify({ tool: 'worker', pid: process.pid }) + '\\n');
 const ready = () => {
+  if (process.env.KKR_STUB_STARTUP_ERROR) { process.stderr.end(process.env.KKR_STUB_STARTUP_ERROR, () => process.exit(1)); return; }
   fs.appendFileSync(events, JSON.stringify({ tool: 'worker-ready', at: Date.now() }) + '\\n');
   process.stdout.write(JSON.stringify({ ready: true }) + '\\n');
 };
@@ -155,9 +156,11 @@ const out = process.argv[process.argv.length - 1];
 const sink = /^pipe:/.test(out) ? null : out;
 if (sink && process.env.KKR_STUB_ENCODER_IGNORE_TERM) process.on('SIGTERM', () => {});
 if (sink && process.env.KKR_STUB_ENCODER_TERM_SUCCESS) process.on('SIGTERM', () => process.exit(0));
+if (sink && process.env.KKR_STUB_ENCODER_FAIL_EARLY) process.stderr.end(process.env.KKR_STUB_ENCODER_ERROR, () => process.exit(1));
 process.stdin.on('data', chunk => { if (sink) fs.appendFileSync(sink, chunk); else process.stdout.write(chunk); });
 process.stdin.on('end', () => {
   fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffmpeg-end', pid: process.pid }) + '\\n');
+  if (sink && process.env.KKR_STUB_ENCODER_ERROR) { process.stderr.end(process.env.KKR_STUB_ENCODER_ERROR, () => process.exit(1)); return; }
   const hold = sink && Number(process.env.KKR_STUB_ENCODER_HOLD_MS || 0);
   hold ? setTimeout(() => process.exit(0), hold) : process.exit(0);
 });
@@ -1058,6 +1061,70 @@ run('export deactivation waits for close and uses a bounded hard-kill fallback',
     assert(harness.errors.length === 0 && harness.information.length === 0, 'deactivation reported a user cancellation as success or failure');
 });
 
+run('exports surface setup, synthesis, and encoder diagnostics without debug', () => {
+    const cases = [
+        { env: { KKR_STUB_STARTUP_ERROR: "ModuleNotFoundError: No module named 'kokoro_onnx'" }, detail: "No module named 'kokoro_onnx'" },
+        { env: { KKR_STUB_FAIL_PHONEMES: 'One paragraph.' }, detail: 'stub synthesis failed' },
+        { env: { KKR_STUB_ENCODER_ERROR: 'noise '.repeat(10000) + "Unknown encoder 'libmp3lame'" }, detail: "Unknown encoder 'libmp3lame'" },
+        { env: { KKR_STUB_ENCODER_FAIL_EARLY: '1', KKR_STUB_ENCODER_ERROR: "Unknown encoder 'libmp3lame'", KKR_STUB_SYNTH_DELAY: '400' },
+            text: 'One paragraph.\n\nAnother.\n', detail: "Unknown encoder 'libmp3lame'" },
+    ];
+    for (const item of cases) {
+        const paths = stubs({ text: item.text || 'One paragraph.\n' }), output = path.join(paths.dir, 'saved.wav');
+        fs.writeFileSync(output, 'previous output');
+        try {
+            const result = cli([...cliArgs(paths), '--output', output, paths.input], { env: { ...stubEnv(paths), ...item.env } });
+            assert(result.status === 1 && result.stderr.includes(item.detail), `missing actionable error: ${result.stderr}`);
+            assert(result.stderr.length < 3000, 'CLI dumped unbounded diagnostic stderr without debug');
+            assert(fs.readFileSync(output, 'utf8') === 'previous output' && !fs.existsSync(output + '.part'), 'diagnostic failure published or retained partial output');
+        } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+    }
+});
+
+run('export diagnostics handle fragmented UTF-8 and post-exit drainage without persisting source', async () => {
+    for (const detail of ["No module named 'kokoro_onnx'", 'stub synthesis failed', "Unknown encoder 'libmp3lame'"]) {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-export-diagnostic-'));
+        const sourcePath = path.join(dir, 'input.md'), extensionPath = path.join(dir, 'extension');
+        const harness = extensionHarness({ selection: { isEmpty: true },
+            document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'PRIVATE-SOURCE' } }, { extensionPath });
+        try {
+            await harness.commands.get('kokoreader.saveFile')();
+            const call = harness.spawned[0];
+            const statuses = harness.statusItems.map(item => item.text);
+            assert(call.options.stdio[2] === 'pipe', 'export stderr is not captured');
+            call.child.stderr.emit('data', Buffer.from('noise '.repeat(10000)));
+            call.child.emit('exit', 1);
+            assert(harness.errors.length === 0, 'error was reported before final stream drainage');
+            const bytes = Buffer.from(`\r[1/1] synthesizing...Error: ${detail}: 编码失败 PRIVATE-DIAGNOSTIC`);
+            for (let index = 0; index < bytes.length; index += 3) call.child.stderr.emit('data', bytes.subarray(index, index + 3));
+            call.child.stderr.emit('end');
+            call.child.emit('close', 1);
+            assert(harness.errors.length === 1 && harness.errors[0].includes(detail) && harness.errors[0].includes('编码失败'), `missing or corrupt fragmented error: ${JSON.stringify(harness.errors)}`);
+            assert(harness.errors[0].length < 1100 && harness.information.length === 0, 'failure used an unbounded or success notification');
+            assert(JSON.stringify(harness.statusItems.map(item => item.text)) === JSON.stringify(statuses), 'diagnostic stderr changed playback progress');
+            const log = fs.readFileSync(path.join(extensionPath, 'logs', 'err.jsonl'), 'utf8');
+            assert(!log.includes('PRIVATE-SOURCE') && !log.includes('PRIVATE-DIAGNOSTIC') && !log.includes(detail), 'persistent log included source or raw diagnostics');
+            assert(!fs.existsSync(call.args.at(-1)), 'failure did not release private input');
+        } finally { await harness.extension.deactivate(); fs.rmSync(dir, { recursive: true, force: true }); }
+    }
+});
+
+run('export process errors report once and retain input until close', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-export-spawn-'));
+    const sourcePath = path.join(dir, 'input.md');
+    const harness = extensionHarness({ selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'text' } }, { extensionPath: path.join(dir, 'extension') });
+    try {
+        await harness.commands.get('kokoreader.saveFile')();
+        const call = harness.spawned[0];
+        call.child.emit('error', new Error('spawn ENOENT'));
+        assert(fs.existsSync(call.args.at(-1)), 'process error released input before close');
+        call.child.emit('close', -2);
+        assert(harness.errors.length === 1 && harness.errors[0].includes('spawn ENOENT') && harness.information.length === 0, 'spawn failure was reported more than once');
+        assert(!fs.existsSync(call.args.at(-1)), 'spawn failure did not release input on close');
+    } finally { await harness.extension.deactivate(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 run('extension clears saving state when the Save dialog rejects', async () => {
     const sourcePath = '/tmp/kokoreader-dialog-error.md';
     const harness = extensionHarness({
@@ -1707,21 +1774,15 @@ run('failed lookahead prevents or stops active playback immediately', () => {
 
 run('live playback leaves 800 ms between source paragraphs', () => {
     const paths = stubs({ text: 'First.\n\nSecond.\n' });
-    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
-        env: { ...process.env, ...stubEnv(paths), KKR_STUB_FFPLAY_HOLD_MS: '100' },
-    });
-    child.stderr.resume();
     try {
-        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'ffplay').length >= 2),
-            'second paragraph never began playback');
-        const plays = stubEvents(paths).filter(event => event.tool === 'ffplay');
-        const firstExit = stubEvents(paths).find(event => event.tool === 'ffplay-exit' && event.pid === plays[0].pid);
-        assert(firstExit && plays[1].at - firstExit.at >= 700,
-            `paragraph gap was ${plays[1].at - firstExit.at} ms, expected about 800 ms`);
-    } finally {
-        child.kill();
-        fs.rmSync(paths.dir, { recursive: true, force: true });
-    }
+        liveProbe(paths, { KKR_STUB_FFPLAY_HOLD_MS: '100' }, `
+    await wait(() => players().length >= 2);
+    const firstExit = events().find(event => event.tool === 'ffplay-exit' && event.pid === players()[0].pid);
+    assert(firstExit && players()[1].at - firstExit.at >= 700, 'source paragraph gap was shorter than 800 ms');
+    child.stdin.write('stop\\n');
+    await wait(() => exited && events().filter(event => event.pid).every(event => !alive(event.pid)));
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
 });
 
 run('saved audio includes 800 ms of silence between source paragraphs', () => {

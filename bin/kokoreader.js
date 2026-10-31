@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 const https = require('https');
 const readline = require('readline');
+const { StringDecoder } = require('string_decoder');
 const { spawn } = require('child_process');
 
 const MODEL_FILES = {
@@ -337,6 +338,16 @@ function paragraphs(text, cfg) {
         .filter(Boolean);
 }
 
+function collectStderr(stream, debug = false) {
+    const decoder = new StringDecoder('utf8');
+    let tail = '';
+    const append = text => { tail = (tail + text).slice(-8192); };
+    stream.on('data', chunk => { append(decoder.write(chunk)); if (debug) process.stderr.write(chunk); });
+    stream.on('end', () => append(decoder.end()));
+    stream.on('error', () => {});
+    return () => tail.trim().replace(/\s+/g, ' ').slice(-800);
+}
+
 class Worker {
     constructor(cfg) {
         const { model, voices } = requireAssets(cfg);
@@ -359,15 +370,19 @@ class Worker {
             this.close();
         }, WORKER_STARTUP_TIMEOUT_MS);
         readline.createInterface({ input: this.proc.stdout }).on('line', line => this.receive(line));
-        this.proc.stderr.on('data', chunk => { if (cfg.DEBUG) process.stderr.write(chunk); });
+        const diagnostic = collectStderr(this.proc.stderr, cfg.DEBUG);
         this.proc.on('error', error => {
+            this.exited = true;
             this.fail(error);
             this.finishExit();
         });
-        this.proc.on('exit', (code, signal) => {
+        this.proc.on('exit', () => { this.exited = true; });
+        this.proc.on('close', (code, signal) => {
             this.exited = true;
             this.finishExit();
-            this.fail(new Error(code === null ? `Kokoro worker exited from ${signal || 'a signal'}` : `Kokoro worker exited with code ${code}`));
+            const detail = diagnostic();
+            const status = code === null ? `Kokoro worker exited from ${signal || 'a signal'}` : `Kokoro worker exited with code ${code}`;
+            this.fail(new Error(status + (detail ? `: ${detail}` : '')));
         });
     }
     receive(line) {
@@ -605,9 +620,10 @@ function startSaveEncoder(cfg, sampleRate) {
     const args = ['-y', '-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg)];
     if (cfg.SAMPLE_RATE) args.push('-ar', String(cfg.SAMPLE_RATE));
     args.push('-f', cfg.FORMAT, temporary);
-    const ffmpeg = activeFfmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'ignore'] });
+    const ffmpeg = activeFfmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'pipe'] });
     ffmpeg.stdin.on('error', () => {});
-    let cancelled = false, exited = false, killTimer = null;
+    const diagnostic = collectStderr(ffmpeg.stderr);
+    let cancelled = false, exited = false, killTimer = null, failure = null;
     const closed = new Promise(resolve => ffmpeg.once('close', () => {
         exited = true;
         clearTimeout(killTimer);
@@ -618,9 +634,13 @@ function startSaveEncoder(cfg, sampleRate) {
     ffmpeg.once('spawn', () => { if (cancelled) { try { ffmpeg.kill(); } catch (_) {} } });
     const done = new Promise((resolve, reject) => {
         ffmpeg.on('error', reject);
-        ffmpeg.on('close', code => {
+        ffmpeg.on('close', (code, signal) => {
             if (cancelled) return reject(new Error('Audio export cancelled'));
-            if (code !== 0) return reject(new Error(`ffmpeg exited with code ${code}`));
+            if (code !== 0) {
+                const detail = diagnostic();
+                const status = code === null ? `ffmpeg exited from ${signal || 'a signal'}` : `ffmpeg exited with code ${code}`;
+                return reject(new Error(status + (detail ? `: ${detail}` : '')));
+            }
             if (!fs.existsSync(temporary)) return reject(new Error(`ffmpeg produced no audio for ${cfg.OUTPUT_FILE}`));
             try { fs.renameSync(temporary, cfg.OUTPUT_FILE); if (activePartFile === temporary) activePartFile = null; resolve(); }
             catch (error) { reject(error); }
@@ -628,10 +648,18 @@ function startSaveEncoder(cfg, sampleRate) {
     });
     // Publish atomically: a failed read must leave the previous file alone, and
     // the killed encoder must not leave a stray .part behind.
-    done.catch(() => { try { fs.unlinkSync(temporary); } catch (_) {} });
+    done.catch(error => { if (!cancelled) failure = error; try { fs.unlinkSync(temporary); } catch (_) {} });
     return activeEncoder = {
         stdin: ffmpeg.stdin,
         done,
+        get failure() { return failure; },
+        async write(pcm) {
+            try { await new Promise((resolve, reject) => ffmpeg.stdin.write(pcm, error => error ? reject(error) : resolve())); }
+            catch (error) {
+                await this.abort();
+                throw failure || new Error(`ffmpeg input failed: ${diagnostic() || error.message}`);
+            }
+        },
         abort() {
             cancelled = true;
             try { ffmpeg.stdin.destroy(); ffmpeg.kill(); } catch (_) {}
@@ -809,14 +837,17 @@ async function read(inputFile, cfg) {
                 process.stderr.write(`\r[${unit.paragraph}/${unit.total}] synthesizing...`);
                 const result = await worker.synthesize(unit.phonemes, cfg);
                 if (stopping) break;
-                if (!saver) saver = startSaveEncoder(cfg, result.sampleRate);
+                if (!saver) {
+                    saver = startSaveEncoder(cfg, result.sampleRate);
+                    saver.done.catch(() => { worker.close(); });
+                }
                 if (previousParagraph && unit.paragraph !== previousParagraph) {
                     const bytes = Math.round(result.sampleRate * 2 * cfg.TEMPO * PARAGRAPH_PAUSE_MS / 1000);
-                    await new Promise((resolve, reject) => saver.stdin.write(Buffer.alloc(bytes), error => error ? reject(error) : resolve()));
+                    await saver.write(Buffer.alloc(bytes));
                 }
                 // The write callback fires once flushed to the OS, which is the
                 // backpressure that keeps memory bounded to one synthesis unit.
-                await new Promise((resolve, reject) => saver.stdin.write(result.pcm, error => error ? reject(error) : resolve()));
+                await saver.write(result.pcm);
                 previousParagraph = unit.paragraph;
             }
         } else {
@@ -826,7 +857,7 @@ async function read(inputFile, cfg) {
         if (saver) { saver.stdin.end(); await saver.done; }
         process.stderr.write('\n');
     } catch (error) {
-        if (saver) await saver.abort();
+        if (saver) { await saver.abort(); if (saver.failure) error = saver.failure; }
         if (!stopping) throw error;
     } finally {
         if (liveController) { liveController.close(); await liveController.workerClosing; } else await worker?.close();

@@ -5,6 +5,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { StringDecoder } = require('string_decoder');
 
 let activeProc = null;
 let activeSave = null;
@@ -258,8 +259,14 @@ function activate(context) {
             setSaving(false);
             return vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
         }
-        const process = spawnCli([...configArgs(config), '--output', target.fsPath, input.file], { stdio: ['pipe', 'ignore', 'ignore'] });
+        const process = spawnCli([...configArgs(config), '--output', target.fsPath, input.file], { stdio: ['pipe', 'ignore', 'pipe'] });
         process.stdin.on('error', () => {});
+        const decoder = new StringDecoder('utf8');
+        let stderr = '';
+        const append = text => { stderr = (stderr + text).slice(-8192); };
+        process.stderr.on('data', chunk => append(decoder.write(chunk)));
+        process.stderr.on('end', () => append(decoder.end()));
+        process.stderr.on('error', () => {});
         activeSave = process;
         setSaving(true);
         let cleaned = false, cancelled = false, processError = false, killTimer = null, resolveClosed;
@@ -288,16 +295,22 @@ function activate(context) {
         item.text = `$(sync~spin) Kokoreader: saving ${path.basename(target.fsPath)}...`;
         item.show();
         process.on('error', error => {
+            if (processError) return;
             processError = true;
             if (!cancelled && activeSave === process) {
                 appendErrorLog(context, { kind: 'export', event: 'spawn', detail: 'export process failed to start' });
-                vscode.window.showErrorMessage(`Kokoreader: ${error.message}`);
+                vscode.window.showErrorMessage(`Kokoreader: ${error.message.slice(0, 1000)}`);
             }
         });
         process.on('close', (code, signal) => {
             if (!cancelled && !processError && activeSave === process) {
-                if (code !== 0 || signal) appendErrorLog(context, { kind: 'export', event: 'exit', code, signal: signal || null, detail: signal ? `export stopped by ${signal}` : `export failed (exit ${code})` });
-                vscode.window.showInformationMessage(code === 0 ? `Kokoreader: saved to ${target.fsPath}` : `Kokoreader: save failed (${signal || `exit ${code}`})`);
+                if (code !== 0 || signal) {
+                    const lines = stderr.replace(/\r/g, '\n').split('\n');
+                    const error = lines.filter(line => line.includes('Error: ')).at(-1);
+                    const detail = (error ? error.slice(error.indexOf('Error: ') + 7).trim() : signal ? `export stopped by ${signal}` : `export failed (exit ${code})`).slice(0, 1000);
+                    appendErrorLog(context, { kind: 'export', event: 'exit', code, signal: signal || null, detail: signal ? `export stopped by ${signal}` : `export failed (exit ${code})` });
+                    vscode.window.showErrorMessage(`Kokoreader: save failed: ${detail}`);
+                } else vscode.window.showInformationMessage(`Kokoreader: saved to ${target.fsPath}`);
             }
             item.dispose(); clearSave();
         });
