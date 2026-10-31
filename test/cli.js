@@ -121,8 +121,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   const request = JSON.parse(line);
   fs.appendFileSync(events, JSON.stringify({ ...request, at: Date.now() }) + '\\n');
   const send = () => {
+    fs.appendFileSync(events, JSON.stringify({ tool: 'worker-response', id: request.id, at: Date.now() }) + '\\n');
     if (request.action === 'prepare') {
-      const units = process.env.KKR_STUB_UNITS ? JSON.parse(process.env.KKR_STUB_UNITS) : [request.text];
+      const byText = process.env.KKR_STUB_UNITS_BY_TEXT ? JSON.parse(process.env.KKR_STUB_UNITS_BY_TEXT) : {};
+      const units = byText[request.text] || (process.env.KKR_STUB_UNITS ? JSON.parse(process.env.KKR_STUB_UNITS) : [request.text]);
       process.stdout.write(JSON.stringify({ id: request.id, units, warning: process.env.KKR_STUB_WARNING || undefined }) + '\\n');
     } else if ((process.env.KKR_STUB_FAIL_TEXT && request.text && request.text.includes(process.env.KKR_STUB_FAIL_TEXT)) ||
                (process.env.KKR_STUB_FAIL_PHONEMES && request.phonemes && request.phonemes.includes(process.env.KKR_STUB_FAIL_PHONEMES))) {
@@ -134,7 +136,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     } else if (request.action === 'list') {
       process.stdout.write(JSON.stringify({ id: request.id, voices: ['af_heart'] }) + '\\n');
     } else {
-      process.stdout.write(JSON.stringify({ id: request.id, pcm: process.env.KKR_STUB_PCM, sampleRate: 24000, warning: process.env.KKR_STUB_WARNING || undefined }) + '\\n');
+      const byPhoneme = process.env.KKR_STUB_PCM_BY_PHONEME ? JSON.parse(process.env.KKR_STUB_PCM_BY_PHONEME) : {};
+      process.stdout.write(JSON.stringify({ id: request.id, pcm: byPhoneme[request.phonemes] || process.env.KKR_STUB_PCM, sampleRate: 24000, warning: process.env.KKR_STUB_WARNING || undefined }) + '\\n');
     }
   };
   delay ? setTimeout(send, delay) : send();
@@ -151,6 +154,9 @@ process.stdin.on('end', () => process.exit(0));
     fs.writeFileSync(path.join(paths.tools, 'ffplay'), `#!/usr/bin/env node
 const fs = require('fs');
 fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffplay', pid: process.pid, at: Date.now() }) + '\\n');
+const chunks = [];
+process.stdin.on('data', chunk => chunks.push(chunk));
+process.stdin.on('end', () => fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffplay-input', pid: process.pid, pcm: Buffer.concat(chunks).toString('base64') }) + '\\n'));
 const hold = Number(process.env.KKR_STUB_FFPLAY_HOLD_MS || 0);
 if (hold) setTimeout(() => { fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffplay-exit', pid: process.pid, at: Date.now() }) + '\\n'); process.exit(0); }, hold);
 else if (process.env.KKR_STUB_FFPLAY_HOLD === '0') process.stdin.on('end', () => process.exit(0));
@@ -191,6 +197,38 @@ function isAlive(pid) {
 
 function cliArgs(paths) {
     return ['--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices];
+}
+
+function liveProbe(paths, env, scenario) {
+    const probe = `
+const { spawn } = require('child_process');
+const fs = require('fs');
+const paths = JSON.parse(process.argv[2]);
+const events = () => fs.existsSync(paths.events) ? fs.readFileSync(paths.events, 'utf8').split('\\n').filter(Boolean).map(JSON.parse) : [];
+const syntheses = () => events().filter(event => !event.tool && event.action === 'synthesize');
+const players = () => events().filter(event => event.tool === 'ffplay');
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const alive = pid => { try { process.kill(pid, 0); return true; } catch (_) { return false; } };
+const wait = async check => {
+  const deadline = Date.now() + 6000;
+  while (!check()) { if (Date.now() >= deadline) throw new Error('condition timed out'); await sleep(25); }
+};
+(async () => {
+  const child = spawn(process.execPath, [process.argv[1], '--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices, paths.input], { stdio: ['pipe', 'ignore', 'pipe'] });
+  let exited = null, stderr = '';
+  child.on('exit', (code, signal) => { exited = { code, signal }; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  try {
+    ${scenario}
+  } catch (error) { throw new Error(error.message + ': ' + stderr + ' events=' + JSON.stringify(events())); }
+  finally { child.kill(); await wait(() => exited); }
+})().then(() => process.exit(0), error => { console.error(error.message); process.exit(1); });
+`;
+    const result = spawnSync(process.execPath, ['-e', probe, CLI, JSON.stringify(paths)], {
+        encoding: 'utf8', timeout: 15000, env: { ...process.env, ...stubEnv(paths), ...env },
+    });
+    assert(result.status === 0, `live probe failed: ${result.stderr}`);
 }
 
 run('--help describes the Kokoro reader CLI', () => {
@@ -1156,6 +1194,187 @@ run('live playback synthesizes the next unit before the current player exits', (
         child.kill();
         fs.rmSync(paths.dir, { recursive: true, force: true });
     }
+});
+
+run('live playback prefetches every same-paragraph unit in bounded PCM order', () => {
+    const paths = stubs({ text: 'One long paragraph.\n' });
+    const units = ['one', 'two', 'three'];
+    const pcm = Object.fromEntries(units.map((unit, index) => [unit, Buffer.alloc(8, index + 1).toString('base64')]));
+    try {
+        const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+            encoding: 'utf8', timeout: 8000,
+            env: { ...process.env, ...stubEnv(paths), KKR_STUB_UNITS: JSON.stringify(units),
+                KKR_STUB_PCM_BY_PHONEME: JSON.stringify(pcm), KKR_STUB_SYNTH_DELAY: '80', KKR_STUB_FFPLAY_HOLD_MS: '400' },
+        });
+        assert(result.status === 0, `reader failed: ${result.stderr}`);
+        const events = stubEvents(paths);
+        const syntheses = events.filter(event => !event.tool && event.action === 'synthesize');
+        const plays = events.filter(event => event.tool === 'ffplay');
+        assert(JSON.stringify(syntheses.map(event => event.phonemes)) === JSON.stringify(units), 'units were not synthesized once in order');
+        assert(plays.length === 3, `expected three players, got ${plays.length}`);
+        assert(JSON.stringify(plays.map(play => events.find(event => event.tool === 'ffplay-input' && event.pid === play.pid)?.pcm)) ===
+            JSON.stringify(units.map(unit => pcm[unit])), 'played PCM was missing, duplicated, or reordered');
+        for (let index = 0; index < 2; index++) {
+            const exit = events.find(event => event.tool === 'ffplay-exit' && event.pid === plays[index].pid);
+            assert(syntheses[index + 1].at < exit.at, `unit ${index + 2} was not synthesized during current playback`);
+            assert(plays[index + 1].at - exit.at < 700, 'same-paragraph units received an extra paragraph gap');
+        }
+        const firstExit = events.find(event => event.tool === 'ffplay-exit' && event.pid === plays[0].pid);
+        assert(syntheses[2].at >= firstExit.at, 'prefetch ran more than one unit ahead');
+        const inFlight = new Set();
+        for (const event of events) {
+            if (event.tool === 'worker-response') inFlight.delete(event.id);
+            else if (event.action === 'synthesize') inFlight.add(event.id);
+            assert(inFlight.size <= 1, 'model inference requests overlapped');
+        }
+        assert(events.filter(event => event.tool === 'worker').length === 1, 'prefetch started another model worker');
+    } finally {
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('same-paragraph prefetch waits when paused before first playback', () => {
+    const paths = stubs({ text: 'One paragraph.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_SYNTH_DELAY: '200', KKR_STUB_FFPLAY_HOLD: '1' }, `
+    await wait(() => events().some(event => !event.tool && event.action === 'prepare'));
+    child.stdin.write('pause\\n');
+    await wait(() => syntheses().length === 1 && events().some(event => event.tool === 'worker-response' && event.id === syntheses()[0].id));
+    await sleep(300);
+    assert(players().length === 0 && syntheses().length === 1, 'pause allowed playback or successor synthesis');
+    child.stdin.write('resume\\n');
+    await wait(() => players().length === 1 && syntheses().length === 2);
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+    assert(exited.code === 0, 'Stop failed');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch stops advancing when paused during successor synthesis', () => {
+    const paths = stubs({ text: 'One paragraph.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_SYNTH_DELAY: '250', KKR_STUB_FFPLAY_HOLD_MS: '1000' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    const first = players()[0];
+    child.stdin.write('pause\\n');
+    await wait(() => !alive(first.pid));
+    await wait(() => events().some(event => event.tool === 'worker-response' && event.id === syntheses()[1].id));
+    await sleep(350);
+    assert(syntheses().length === 2 && players().length === 1, 'pause advanced beyond the in-flight successor');
+    child.stdin.write('resume\\n');
+    await wait(() => syntheses().length === 3 && players().length >= 2);
+    const replay = players()[1];
+    const replayExit = events().find(event => event.tool === 'ffplay-exit' && event.pid === replay.pid);
+    assert(replayExit && syntheses()[2].at >= replayExit.at, 'third unit ran ahead while first was replayed');
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+    assert(exited.code === 0, 'Stop failed');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch Stop cancels the worker without playing stale audio', () => {
+    const paths = stubs({ text: 'One paragraph.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD: '1' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    const worker = events().find(event => event.tool === 'worker');
+    const player = players()[0];
+    child.stdin.write('stop\\n');
+    await wait(() => exited && !alive(worker.pid) && !alive(player.pid));
+    await sleep(450);
+    assert(exited.code === 0, 'Stop failed');
+    assert(syntheses().length === 2 && players().length === 1, 'stale work continued after Stop');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch navigation discards pending successor PCM', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const pcm = { one: Buffer.alloc(8, 1).toString('base64'), two: Buffer.alloc(8, 2).toString('base64'), next: Buffer.alloc(8, 4).toString('base64') };
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS_BY_TEXT: '{"First.":["one","two","three"],"Second.":["next"]}',
+            KKR_STUB_PCM_BY_PHONEME: JSON.stringify(pcm), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '1000' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    const oldWorker = events().find(event => event.tool === 'worker');
+    child.stdin.write('next\\n');
+    await wait(() => events().some(event => event.tool === 'ffplay-input' && event.pcm === '${pcm.next}'));
+    assert(!alive(oldWorker.pid), 'navigation left the old worker alive');
+    assert(!syntheses().some(event => event.phonemes === 'three'), 'navigation synthesized another stale unit');
+    assert(!events().some(event => event.tool === 'ffplay-input' && event.pcm === '${pcm.two}'), 'navigation played the stale successor');
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch navigation from pause keeps the new target withheld', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS_BY_TEXT: '{"First.":["one","two","three"],"Second.":["next"]}',
+            KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD: '1' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    child.stdin.write('pause\\nnext\\n');
+    await wait(() => syntheses().some(event => event.phonemes === 'next'));
+    await sleep(500);
+    assert(players().length === 1, 'paused navigation started the new target');
+    assert(!syntheses().some(event => event.phonemes === 'three'), 'paused navigation continued stale synthesis');
+    child.stdin.write('resume\\n');
+    await wait(() => players().length === 2);
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+    assert(exited.code === 0, 'Stop failed');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('cross-paragraph prefetch does not start synthesis after prepare completes while paused', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_SYNTH_DELAY: '600', KKR_STUB_FFPLAY_HOLD_MS: '1000' }, `
+    await wait(() => events().some(event => !event.tool && event.action === 'prepare' && event.text === 'Second.') && players().length === 1);
+    const preparing = events().find(event => !event.tool && event.action === 'prepare' && event.text === 'Second.');
+    child.stdin.write('pause\\n');
+    await wait(() => events().some(event => event.tool === 'worker-response' && event.id === preparing.id));
+    await sleep(250);
+    assert(syntheses().length === 1 && players().length === 1, 'paused preparation launched successor synthesis');
+    child.stdin.write('resume\\n');
+    await wait(() => syntheses().length === 2 && players().length === 3);
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+    assert(exited.code === 0, 'Stop failed');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch failure stops playback and exits with an error', () => {
+    const paths = stubs({ text: 'One paragraph.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_FAIL_PHONEMES: 'two',
+            KKR_STUB_SYNTH_DELAY: '800', KKR_STUB_FFPLAY_HOLD: '1' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    const player = players()[0];
+    await wait(() => exited && !alive(player.pid));
+    assert(exited.code === 1 && stderr.includes('stub synthesis failed'), 'lookahead error was not surfaced');
+    assert(syntheses().length === 2 && players().length === 1, 'failed lookahead launched further work');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch failure exits even while playback is paused', () => {
+    const paths = stubs({ text: 'One paragraph.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_FAIL_PHONEMES: 'two',
+            KKR_STUB_SYNTH_DELAY: '800', KKR_STUB_FFPLAY_HOLD: '1' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    child.stdin.write('pause\\n');
+    await wait(() => exited);
+    assert(exited.code === 1 && stderr.includes('stub synthesis failed'), 'paused lookahead error was not surfaced');
+    assert(!players().some(player => alive(player.pid)), 'paused lookahead error left a player alive');
+    assert(syntheses().length === 2, 'paused lookahead error launched further work');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
 });
 
 run('navigation during synthesis replaces the worker and plays only the selected paragraph', () => {

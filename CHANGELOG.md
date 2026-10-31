@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Restored one-unit synthesis prefetch within split paragraphs, preserving ordered playback and the 800 ms gap only between source paragraphs.
+- Paused playback now withholds further prefetch requests, and a failed lookahead wakes cancelled pause waits so the reader exits with an error instead of waiting for Resume.
+
 ## 0.3.0
 
 ### Added

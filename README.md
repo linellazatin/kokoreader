@@ -23,7 +23,7 @@ Use the CLI for files and pipelines, or use the VS Code/VSCodium extension to re
 
 ### Long-document playback that stays moving
 
-Kokoreader phonemizes text before synthesis, splits it safely below Kokoro’s model boundary, and keeps one upcoming unit synthesized while the current one plays. That avoids the long-paragraph bounds failure and reduces dead air caused by waiting for the next inference.
+Kokoreader phonemizes text before synthesis, splits it safely below Kokoro’s model boundary, and synthesizes one upcoming unit while the current one plays, including split units within the same paragraph. It uses one resident inference worker; if the upcoming audio is not ready when playback ends, it waits for that synthesis to finish. Pause allows an already-running prefetch request to finish but withholds further prefetch requests until Resume. That avoids the long-paragraph bounds failure and reduces dead air caused by waiting for the next inference.
 
 It preserves a natural **800 ms** gap between source paragraphs in both live playback and saved audio, without adding pauses inside a paragraph that was safely split into multiple units. The first unit targets an early sentence boundary within 200 phonemes to reduce time to first audio; later units retain the 500-phoneme safety boundary.
 
