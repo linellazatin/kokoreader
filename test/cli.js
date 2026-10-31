@@ -250,6 +250,39 @@ const wait = async check => {
     assert(result.status === 0, `live probe failed: ${result.stderr}`);
 }
 
+function downloadHarness(transport, getError, configure) {
+    const { PassThrough } = require('stream');
+    const crypto = require('crypto');
+    const payloads = { 'kokoro-v1.0.onnx': Buffer.from('offline model fixture'), 'voices-v1.0.bin': Buffer.from('offline voice fixture') };
+    const files = [], writers = [];
+    const https = { get(url, callback) {
+        if (getError) throw getError;
+        const request = new EventEmitter();
+        let response;
+        request.setTimeout = () => request;
+        request.destroy = error => { request.destroyed = true; request.emit('error', error); response?.destroy(error); };
+        setImmediate(() => {
+            if (request.destroyed) return;
+            const payload = payloads[path.basename(new URL(url).pathname)];
+            response = new PassThrough();
+            response.statusCode = 200;
+            response.headers = { 'content-length': String(payload.length) };
+            configure?.(response, url);
+            callback(response);
+            transport ? transport(response, payload, request) : response.end(payload);
+        });
+        return request;
+    } };
+    const source = fs.readFileSync(CLI, 'utf8');
+    const context = { require: name => name === 'https' ? https : name === 'fs' ? { ...fs, createWriteStream(file, ...args) {
+        files.push(file); const writer = fs.createWriteStream(file, ...args); writers.push(writer); return writer;
+    } } : require(name), Buffer, setTimeout, clearTimeout, URL, __dirname: path.dirname(CLI), module: { exports: {} },
+        process: { env: {}, on() {}, stdout: { write() {} }, stderr: { write() {} } } };
+    vm.runInNewContext(source.slice(0, source.lastIndexOf('\nmain().catch(')) + '\nmodule.exports = { downloadAssets, killActive, ASSET_SHA256 };', context, { filename: CLI });
+    for (const [name, payload] of Object.entries(payloads)) context.module.exports.ASSET_SHA256[name] = crypto.createHash('sha256').update(payload).digest('hex');
+    return { ...context.module.exports, payloads, files, writers };
+}
+
 function playbackHarness(play) {
     const source = fs.readFileSync(CLI, 'utf8');
     const entry = source.lastIndexOf('\nmain().catch(');
@@ -907,7 +940,7 @@ run('download is bounded by timeout, redirect depth, and transfer length', () =>
     assert(source.includes('setTimeout'), 'download has no stall timeout');
     assert(source.includes("response.headers['content-length']"), 'transfer length is never checked');
     assert(source.includes('new URL('), 'relative redirect locations are not resolved');
-    assert(source.includes('response.resume()'), 'discarded redirect bodies pin a socket');
+    assert(source.includes('response.destroy()'), 'discarded response bodies are not closed');
 });
 
 run('text comparisons are not mistaken for HTML tags', () => {
@@ -1972,6 +2005,145 @@ run('download verifies existing assets by sha256 and never replaces them unasked
     assert(result.stderr.includes('does not match the kokoro-onnx model-files-v1.0 release'), `no staleness warning: ${result.stderr}`);
     assert(result.stderr.includes('--download --force'), 'staleness warning omits the fix');
     assert(unchanged, 'an unverified asset was replaced without --force');
+});
+
+run('download preserves preexisting staging files and symlink sentinels', async () => {
+    for (const symlink of [false, true]) {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+        const target = path.join(directory, 'kokoro-v1.0.onnx');
+        const sentinel = path.join(directory, 'sentinel');
+        fs.writeFileSync(sentinel, 'unrelated sentinel');
+        if (symlink) fs.symlinkSync(sentinel, target + '.download');
+        else fs.writeFileSync(target + '.download', 'unrelated staging');
+        const harness = downloadHarness();
+        try {
+            await harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true });
+            assert(fs.readFileSync(sentinel, 'utf8') === 'unrelated sentinel', 'download overwrote a staging symlink target');
+            assert(fs.existsSync(target + '.download') && (symlink ? fs.lstatSync(target + '.download').isSymbolicLink() : fs.readFileSync(target + '.download', 'utf8') === 'unrelated staging'), 'download changed or removed unrelated staging');
+            for (const [name, payload] of Object.entries(harness.payloads)) assert(fs.readFileSync(path.join(directory, name)).equals(payload), 'verified fixture was not published completely');
+            assert(harness.files.every(file => path.dirname(path.dirname(file)) === directory && !fs.existsSync(path.dirname(file))), 'download did not clean private sibling staging');
+        } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+    }
+});
+
+run('concurrent downloads use independent private staging and complete publication', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+    const held = [];
+    let released = false;
+    const transport = (response, payload) => released ? response.end(payload) : held.push({ response, payload });
+    const left = downloadHarness(transport), right = downloadHarness(transport);
+    const jobs = [left, right].map(harness => harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true }));
+    // Attach rejection handlers before checking paths or releasing either transfer.
+    const completed = Promise.allSettled(jobs);
+    const release = () => { released = true; for (const { response, payload } of held.splice(0)) response.end(payload); };
+    try {
+        await new Promise(resolve => setImmediate(resolve));
+        assert(left.files.length === 1 && right.files.length === 1 && left.files[0] !== right.files[0], 'concurrent downloads shared staging');
+        for (const file of [...left.files, ...right.files]) assert((fs.statSync(path.dirname(file)).mode & 0o777) === 0o700 && path.dirname(path.dirname(file)) === directory, 'download staging was not a private sibling directory');
+        release();
+        const results = await completed;
+        assert(results.every(result => result.status === 'fulfilled'), 'a concurrent downloader failed');
+        for (const [name, payload] of Object.entries(left.payloads)) assert(fs.readFileSync(path.join(directory, name)).equals(payload), 'concurrent downloads mixed or truncated publication');
+        assert([...left.files, ...right.files].every(file => !fs.existsSync(path.dirname(file))), 'concurrent download left private staging');
+    } finally { release(); await completed; fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+run('failed download transfers close writers, preserve assets, and remove owned staging', async () => {
+    const cases = [
+        { detail: 'incomplete', send: (response, payload) => response.end(payload.subarray(0, -1)) },
+        { detail: 'corrupt', send: (response, payload) => response.end(Buffer.alloc(payload.length, 42)) },
+        { detail: 'fixture stream failure', send: response => response.destroy(new Error('fixture stream failure')) },
+        { detail: 'fixture request failure', send: (response, payload, request) => request.destroy(new Error('fixture request failure')) },
+    ];
+    for (const scenario of cases) {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+        const target = path.join(directory, 'kokoro-v1.0.onnx');
+        fs.writeFileSync(target, 'previous custom model');
+        fs.writeFileSync(target + '.download', 'unrelated staging');
+        const harness = downloadHarness(scenario.send);
+        try {
+            let failure;
+            try { await harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true }); }
+            catch (error) { failure = error; }
+            assert(failure?.message.includes(scenario.detail), `wrong transfer failure: ${failure?.message}`);
+            assert(fs.readFileSync(target, 'utf8') === 'previous custom model' && fs.readFileSync(target + '.download', 'utf8') === 'unrelated staging', 'failed download changed prior or unrelated files');
+            assert(harness.writers.every(writer => writer.closed) && fs.readdirSync(directory).every(name => !name.startsWith('.kokoreader-download-')), 'failed download removed staging before writers closed or leaked it');
+        } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+    }
+});
+
+run('download cancellation closes its transfer before owned staging cleanup', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+    const target = path.join(directory, 'kokoro-v1.0.onnx');
+    fs.writeFileSync(target, 'previous custom model');
+    let ready;
+    const started = new Promise(resolve => { ready = resolve; });
+    const harness = downloadHarness((response, payload) => { response.write(payload.subarray(0, 4)); ready(); });
+    const failure = harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true }).catch(error => error);
+    try {
+        await started;
+        await harness.killActive();
+        const error = await failure;
+        assert(error?.message.includes('cancelled'), 'download cancellation did not reject publication');
+        assert(fs.readFileSync(target, 'utf8') === 'previous custom model' && harness.writers.every(writer => writer.closed), 'cancelled download changed prior output or left an open writer');
+        assert(fs.readdirSync(directory).every(name => !name.startsWith('.kokoreader-download-')), 'cancelled download left private staging');
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+run('synchronous download transport setup failure cleans its allocated staging', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+    const harness = downloadHarness(undefined, new Error('fixture transport setup failure'));
+    try {
+        let failure;
+        try { await harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true }); }
+        catch (error) { failure = error; }
+        assert(failure?.message === 'fixture transport setup failure' && fs.readdirSync(directory).length === 0, 'transport setup failure left private staging');
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+run('CLI signal cancels an owned download and preserves prior assets and staging', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-signal-'));
+    const target = path.join(directory, 'kokoro-v1.0.onnx');
+    const hook = path.join(directory, 'offline-https.js');
+    fs.writeFileSync(target, 'previous custom model');
+    fs.writeFileSync(target + '.download', 'unrelated staging');
+    fs.writeFileSync(hook, `const Module = require('module'), { EventEmitter } = require('events'), { PassThrough } = require('stream');
+const load = Module._load;
+Module._load = function(name, ...args) {
+  if (name !== 'https') return load.call(this, name, ...args);
+  return { get(url, callback) {
+    const request = new EventEmitter(), response = new PassThrough();
+    const hold = setInterval(() => {}, 1000);
+    request.setTimeout = () => request;
+    request.destroy = error => { clearInterval(hold); request.emit('error', error); response.destroy(error); };
+    response.statusCode = 200; response.headers = { 'content-length': '10000' };
+    setImmediate(() => { callback(response); response.write(Buffer.from('held')); });
+    return request;
+  } };
+};`);
+    const child = spawn(process.execPath, ['-r', hook, CLI, '--download', '--force', '--model-dir', directory], { stdio: ['ignore', 'ignore', 'pipe'] });
+    child.stderr.resume();
+    const closed = new Promise(resolve => child.once('close', (code, signal) => resolve({ code, signal })));
+    try {
+        assert(waitFor(() => fs.readdirSync(directory).some(name => name.startsWith('.kokoreader-download-') && fs.existsSync(path.join(directory, name, 'asset.download')))), 'offline download did not start writing private staging');
+        child.kill('SIGTERM');
+        const result = await closed;
+        assert(result.code === 128, 'signal did not complete cooperative download cleanup');
+        assert(fs.readFileSync(target, 'utf8') === 'previous custom model' && fs.readFileSync(target + '.download', 'utf8') === 'unrelated staging', 'signal changed prior assets or unrelated staging');
+        assert(fs.readdirSync(directory).every(name => !name.startsWith('.kokoreader-download-')), 'signal left private download staging');
+    } finally { child.kill(); await closed; fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+run('download redirects close retired bodies before continuing verified publication', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+    const retired = [];
+    const harness = downloadHarness((response, payload) => { if (response.statusCode === 200) response.end(payload); }, undefined,
+        (response, url) => { if (retired.length === 0) { response.statusCode = 302; response.headers.location = url + '?mirror=1'; retired.push(response); } });
+    try {
+        await harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true });
+        assert(retired.every(response => response.destroyed), 'redirect left its retired response body open');
+        for (const [name, payload] of Object.entries(harness.payloads)) assert(fs.readFileSync(path.join(directory, name)).equals(payload), 'redirect bypassed verified publication');
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
 
 run('--force is download-only and documented', () => {

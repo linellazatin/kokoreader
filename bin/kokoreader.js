@@ -8,6 +8,7 @@ const path = require('path');
 const https = require('https');
 const readline = require('readline');
 const { StringDecoder } = require('string_decoder');
+const { pipeline } = require('stream');
 const { spawn } = require('child_process');
 
 const MODEL_FILES = {
@@ -486,6 +487,7 @@ let activeFfplay = null;
 let activeWorker = null;
 let activeExportDirectory = null;
 let activeEncoder = null;
+let activeDownload = null;
 let stopping = false;
 let cleanupPromise = null;
 let playbackPaused = false;
@@ -503,7 +505,7 @@ function killActive() {
     const worker = activeWorker;
     const encoder = activeEncoder;
     if (liveController) { liveController.generation++; liveController.close(); }
-    const closing = [worker?.close(), encoder?.abort()];
+    const closing = [worker?.close(), encoder?.abort(), activeDownload?.abort()];
     for (const child of [activeFfmpeg, activeFfplay]) {
         try { child?.kill(); } catch (_) {}
     }
@@ -876,40 +878,40 @@ async function read(inputFile, cfg) {
     }
 }
 
-function download(url, destination, redirects = 0) {
+function download(url, destination, redirects = 0, operation) {
     return new Promise((resolve, reject) => {
+        if (stopping || operation?.cancelled) return reject(new Error('Model download cancelled'));
+        let body = null;
         const request = https.get(url, response => {
             if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-                response.resume();
+                response.destroy();
                 if (redirects >= 5) return reject(new Error('download failed: too many redirects'));
-                return resolve(download(new URL(response.headers.location, url).href, destination, redirects + 1));
+                return resolve(download(new URL(response.headers.location, url).href, destination, redirects + 1, operation));
             }
-            if (response.statusCode !== 200) { response.resume(); return reject(new Error(`download failed: HTTP ${response.statusCode}`)); }
+            if (response.statusCode !== 200) { response.destroy(); return reject(new Error(`download failed: HTTP ${response.statusCode}`)); }
+            body = response;
             const expected = Number(response.headers['content-length']);
             const file = fs.createWriteStream(destination);
             let received = 0;
             response.on('data', chunk => { received += chunk.length; });
-            response.pipe(file);
-            file.on('error', reject);
-            response.on('error', reject);
-            file.on('finish', () => file.close(() => {
-                // A truncated asset renames to the real filename and then fails
-                // opaquely at inference time, so reject it here instead.
+            pipeline(response, file, error => {
+                if (error) return reject(error);
                 if (expected && received !== expected) return reject(new Error(`download failed: incomplete (${received}/${expected} bytes)`));
                 resolve();
-            }));
+            });
         });
+        if (operation) operation.request = request;
         request.setTimeout(60000, () => request.destroy(new Error('download timed out')));
-        request.on('error', reject);
+        request.on('error', error => { if (body) body.destroy(error); else reject(error); });
     });
 }
 
-function sha256File(file) {
+function sha256File(file, operation) {
     return new Promise((resolve, reject) => {
         const hash = crypto.createHash('sha256');
-        fs.createReadStream(file).on('error', reject).pipe(hash);
-        hash.on('error', reject);
-        hash.on('finish', () => resolve(hash.digest('hex')));
+        const reader = fs.createReadStream(file);
+        if (operation) operation.reader = reader;
+        pipeline(reader, hash, error => error ? reject(error) : resolve(hash.digest('hex')));
     });
 }
 
@@ -918,6 +920,7 @@ async function downloadAssets(cfg) {
     fs.mkdirSync(cfg.MODEL_DIR, { recursive: true });
     const downloads = { [MODEL_FILES[cfg.MODEL_PRECISION]]: MODEL_URLS[cfg.MODEL_PRECISION], [VOICES_FILE]: VOICES_URL };
     for (const [name, url] of Object.entries(downloads)) {
+        if (stopping) throw new Error('Model download cancelled');
         const target = path.join(cfg.MODEL_DIR, name);
         const expected = ASSET_SHA256[name];
         if (fs.existsSync(target)) {
@@ -931,17 +934,34 @@ async function downloadAssets(cfg) {
             }
             process.stdout.write(`Replacing unverified ${name}...\n`);
         }
-        const temporary = `${target}.download`;
+        const directory = fs.mkdtempSync(path.join(cfg.MODEL_DIR, '.kokoreader-download-'));
+        const temporary = path.join(directory, 'asset.download');
+        let finish;
+        const closed = new Promise(resolve => { finish = resolve; });
+        const operation = activeDownload = {
+            cancelled: false, request: null, reader: null,
+            abort() {
+                this.cancelled = true;
+                const error = new Error('Model download cancelled');
+                this.request?.destroy(error);
+                this.reader?.destroy(error);
+                return closed;
+            },
+        };
         try {
             process.stdout.write(`Downloading ${name}...\n`);
-            await download(url, temporary);
+            await download(url, temporary, 0, operation);
             if (expected) {
-                const digest = await sha256File(temporary);
+                const digest = await sha256File(temporary, operation);
                 if (digest !== expected) throw new Error(`${name} is corrupt: sha256 ${digest}, expected ${expected}`);
             }
+            if (stopping || operation.cancelled) throw new Error('Model download cancelled');
             fs.renameSync(temporary, target);
         }
-        finally { try { fs.unlinkSync(temporary); } catch (_) {} }
+        finally {
+            try { fs.rmSync(directory, { recursive: true, force: true }); }
+            finally { if (activeDownload === operation) activeDownload = null; finish(); }
+        }
     }
 }
 
