@@ -191,6 +191,11 @@ function stubEvents(paths) {
     return fs.readFileSync(paths.events, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
 }
 
+function exportDirectories(output) {
+    const directory = path.dirname(output);
+    return fs.readdirSync(directory).filter(name => name.startsWith('.kokoreader-export-')).map(name => path.join(directory, name));
+}
+
 function sleepSync(ms) {
     spawnSync('sleep', [String(ms / 1000)]);
 }
@@ -721,8 +726,11 @@ run('save path streams each paragraph into one encoder without waiting for the d
     child.stderr.resume();
     child.once('exit', () => {});
     try {
-        const halfway = waitFor(() => (fs.existsSync(`${out}.part`)
-            && fs.statSync(`${out}.part`).size === Buffer.from(STUB_PCM, 'base64').length) || null);
+        const halfway = waitFor(() => {
+            const args = stubEvents(paths).find(event => event.tool === 'ffmpeg')?.args;
+            const temporary = args && args[args.length - 1];
+            return temporary && fs.existsSync(temporary) && fs.statSync(temporary).size === Buffer.from(STUB_PCM, 'base64').length;
+        });
         assert(halfway, 'first paragraph never reached the encoder while the second was still synthesizing');
         assert(!fs.existsSync(out), 'final output was published before the document finished');
         assert(waitFor(() => (fs.existsSync(out) && fs.statSync(out).size === 2 * Buffer.from(STUB_PCM, 'base64').length + 24000 * 2 * 0.8) || null, 8000),
@@ -741,7 +749,142 @@ run('save path encodes once and publishes only on success', () => {
     const encodes = stubEvents(paths).filter(event => event.tool === 'ffmpeg');
     fs.rmSync(paths.dir, { recursive: true, force: true });
     assert(encodes.length === 1, `expected one ffmpeg encode for the document, saw ${encodes.length}`);
-    assert(encodes[0].args[encodes[0].args.length - 1] === `${out}.part`, 'encoder did not write a temporary file');
+    const temporary = encodes[0].args[encodes[0].args.length - 1];
+    assert(path.dirname(path.dirname(temporary)) === paths.dir && path.dirname(temporary) !== paths.dir, 'encoder did not write inside a sibling private directory');
+});
+
+run('export preserves a preexisting sibling part file', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    fs.writeFileSync(output + '.part', 'unrelated partial file');
+    try {
+        const result = cli([...cliArgs(paths), '--output', output, paths.input], { env: stubEnv(paths) });
+        assert(result.status === 0, result.stderr);
+        assert(fs.existsSync(output + '.part') && fs.readFileSync(output + '.part', 'utf8') === 'unrelated partial file', 'preexisting sibling part file was changed or removed');
+        assert(fs.lstatSync(output).isFile(), 'export did not publish a regular file');
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('export does not follow a preexisting sibling part symlink', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    const sentinel = path.join(paths.dir, 'sentinel');
+    fs.writeFileSync(sentinel, 'unrelated sentinel');
+    fs.symlinkSync(sentinel, output + '.part');
+    try {
+        const result = cli([...cliArgs(paths), '--output', output, paths.input], { env: stubEnv(paths) });
+        assert(result.status === 0, result.stderr);
+        assert(fs.readFileSync(sentinel, 'utf8') === 'unrelated sentinel', 'sibling symlink target was overwritten');
+        assert(fs.lstatSync(output + '.part').isSymbolicLink() && fs.lstatSync(output).isFile(), 'export moved the unrelated symlink instead of publishing owned audio');
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('concurrent exports use separate private paths and publish complete outputs', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    const otherPCM = Buffer.alloc(20, 2);
+    try {
+        liveProbe(paths, { KKR_STUB_ENCODER_HOLD_MS: '1500' }, `
+    const path = require('path');
+    const second = spawn(process.execPath, [process.argv[1], '--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices, '--output', ${JSON.stringify(output)}, paths.input], {
+        stdio: ['pipe', 'ignore', 'pipe'], env: { ...process.env, KKR_STUB_PCM: ${JSON.stringify(otherPCM.toString('base64'))} }
+    });
+    second.stderr.resume();
+    let secondExit = null;
+    second.on('close', code => { secondExit = { code }; });
+    try {
+        await wait(() => events().filter(event => event.tool === 'ffmpeg').length === 2);
+        const files = events().filter(event => event.tool === 'ffmpeg').map(event => event.args[event.args.length - 1]);
+        assert(new Set(files).size === 2, 'concurrent encoders shared a temporary path');
+        for (const file of files) {
+            const directory = path.dirname(file);
+            assert(path.dirname(directory) === paths.dir && directory !== paths.dir, 'temporary output was not inside a sibling directory');
+            assert((fs.statSync(directory).mode & 0o777) === 0o700, 'temporary directory was not private');
+        }
+        await wait(() => exited && secondExit);
+        assert(exited.code === 0 && secondExit.code === 0, 'a concurrent publisher failed');
+        const gap = Buffer.alloc(24000 * 2 * 0.8);
+        const left = Buffer.from(${JSON.stringify(STUB_PCM)}, 'base64');
+        const right = Buffer.from(${JSON.stringify(otherPCM.toString('base64'))}, 'base64');
+        const actual = fs.readFileSync(${JSON.stringify(output)});
+        assert(actual.equals(Buffer.concat([left, gap, left])) || actual.equals(Buffer.concat([right, gap, right])), 'concurrent publication mixed or truncated audio');
+        assert(files.every(file => !fs.existsSync(path.dirname(file))), 'completed export left its private directory');
+    } finally { second.kill(); await wait(() => secondExit); }
+`, ['--output', output]);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('cancelling one concurrent export preserves the other private output', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    fs.writeFileSync(output, 'previous output');
+    const otherPCM = Buffer.alloc(20, 2);
+    try {
+        liveProbe(paths, { KKR_STUB_ENCODER_HOLD_MS: '4000' }, `
+    const path = require('path');
+    const second = spawn(process.execPath, [process.argv[1], '--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices, '--output', ${JSON.stringify(output)}, paths.input], {
+        stdio: ['pipe', 'ignore', 'pipe'], env: { ...process.env, KKR_STUB_PCM: ${JSON.stringify(otherPCM.toString('base64'))} }
+    });
+    second.stderr.resume();
+    let secondExit = null;
+    second.on('close', code => { secondExit = { code }; });
+    try {
+        await wait(() => events().filter(event => event.tool === 'ffmpeg-end').length === 2);
+        const files = events().filter(event => event.tool === 'ffmpeg').map(event => event.args[event.args.length - 1]);
+        child.stdin.write('stop\\n');
+        await wait(() => exited);
+        assert(fs.readFileSync(${JSON.stringify(output)}, 'utf8') === 'previous output', 'cancelled export replaced the previous output');
+        const surviving = files.filter(file => fs.existsSync(path.dirname(file)));
+        assert(surviving.length === 1 && fs.existsSync(surviving[0]), 'cancellation removed another export or retained its own directory');
+        await wait(() => secondExit);
+        assert(secondExit.code === 0, 'remaining export failed');
+        const pcm = Buffer.from(${JSON.stringify(otherPCM.toString('base64'))}, 'base64');
+        assert(fs.readFileSync(${JSON.stringify(output)}).equals(Buffer.concat([pcm, Buffer.alloc(38400), pcm])), 'remaining publication was contaminated');
+        assert(files.every(file => !fs.existsSync(path.dirname(file))), 'concurrent cleanup left private output');
+    } finally { second.kill(); await wait(() => secondExit); }
+`, ['--output', output]);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('encoder spawn failure removes its private directory and preserves prior output', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    fs.writeFileSync(output, 'previous output');
+    fs.unlinkSync(path.join(paths.tools, 'ffmpeg'));
+    fs.symlinkSync(process.execPath, path.join(paths.tools, 'node'));
+    try {
+        const result = cli([...cliArgs(paths), '--output', output, paths.input], { env: { ...stubEnv(paths), PATH: paths.tools } });
+        assert(result.status !== 0 && result.stderr.includes('ENOENT'), 'missing encoder did not fail explicitly');
+        assert(fs.readFileSync(output, 'utf8') === 'previous output' && exportDirectories(output).length === 0, 'spawn failure changed prior output or leaked its private directory');
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('synchronous encoder setup failure removes its allocated private directory', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    const source = fs.readFileSync(CLI, 'utf8');
+    const context = { require: name => name === 'child_process' ? { spawn() { throw new Error('synchronous spawn failure'); } } : require(name),
+        Buffer, setTimeout, clearTimeout, __dirname: path.dirname(CLI), module: { exports: {} }, process: { env: {}, on() {}, stderr: { write() {} } } };
+    try {
+        vm.runInNewContext(source.slice(0, source.lastIndexOf('\nmain().catch(')) + '\nmodule.exports = { startSaveEncoder };', context, { filename: CLI });
+        let failure;
+        try { context.module.exports.startSaveEncoder({ OUTPUT_FILE: output, FORMAT: 'wav', VOLUME: 1, GAIN: 0, TEMPO: 1, LIMITER: true }, 24000); }
+        catch (error) { failure = error; }
+        assert(failure?.message === 'synchronous spawn failure' && exportDirectories(output).length === 0, 'synchronous encoder setup leaked its private directory');
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('failed export publication preserves the destination and removes private output', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'existing-directory');
+    const sentinel = path.join(output, 'sentinel');
+    fs.mkdirSync(output);
+    fs.writeFileSync(sentinel, 'unrelated sentinel');
+    try {
+        const result = cli([...cliArgs(paths), '--output', output, paths.input], { env: stubEnv(paths) });
+        assert(result.status !== 0, 'file publication over a directory unexpectedly succeeded');
+        assert(fs.readFileSync(sentinel, 'utf8') === 'unrelated sentinel' && exportDirectories(output).length === 0, 'failed rename changed the destination or leaked private output');
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
 });
 
 run('failed synthesis leaves the previous output file untouched', () => {
@@ -751,7 +894,7 @@ run('failed synthesis leaves the previous output file untouched', () => {
     const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', out, paths.input],
         { env: { ...process.env, ...stubEnv(paths), KKR_STUB_FAIL_PHONEMES: 'Second' } });
     const untouched = fs.existsSync(out) && fs.readFileSync(out, 'utf8') === 'previous';
-    const noPartial = !fs.existsSync(`${out}.part`);
+    const noPartial = exportDirectories(out).length === 0;
     fs.rmSync(paths.dir, { recursive: true, force: true });
     assert(result.status !== 0, 'failing synthesis unexpectedly succeeded');
     assert(untouched, 'partial audio replaced the previous output');
@@ -1035,7 +1178,7 @@ run('export Stop reaps worker and encoder and preserves prior output at every st
     assert(exited.code === 0, 'Stop did not exit successfully');
     await sleep(200);
     assert(fs.readFileSync(${JSON.stringify(output)}, 'utf8') === 'previous output', 'cancelled export replaced prior output');
-    assert(!fs.existsSync(${JSON.stringify(output + '.part')}), 'cancelled export left a partial file');
+    assert(fs.readdirSync(paths.dir).every(name => !name.startsWith('.kokoreader-export-')), 'cancelled export left its private directory');
 `, ['--output', output]);
         } finally {
             for (const event of stubEvents(paths)) if (event.pid) { try { process.kill(event.pid, 'SIGKILL'); } catch (_) {} }
@@ -1076,7 +1219,7 @@ run('exports surface setup, synthesis, and encoder diagnostics without debug', (
             const result = cli([...cliArgs(paths), '--output', output, paths.input], { env: { ...stubEnv(paths), ...item.env } });
             assert(result.status === 1 && result.stderr.includes(item.detail), `missing actionable error: ${result.stderr}`);
             assert(result.stderr.length < 3000, 'CLI dumped unbounded diagnostic stderr without debug');
-            assert(fs.readFileSync(output, 'utf8') === 'previous output' && !fs.existsSync(output + '.part'), 'diagnostic failure published or retained partial output');
+            assert(fs.readFileSync(output, 'utf8') === 'previous output' && exportDirectories(output).length === 0, 'diagnostic failure published or retained partial output');
         } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
     }
 });
@@ -1859,9 +2002,9 @@ run('signaling the CLI mid-export leaves no temporary encoder file behind', () =
     child.stderr.resume();
     child.once('exit', () => {});
     try {
-        assert(waitFor(() => (fs.existsSync(`${out}.part`) || null)), 'encoder never started');
+        assert(waitFor(() => exportDirectories(out).length > 0), 'encoder never started');
         child.kill('SIGTERM');
-        assert(waitFor(() => (!fs.existsSync(`${out}.part`) && !fs.existsSync(out)) || null, 3000),
+        assert(waitFor(() => (exportDirectories(out).length === 0 && !fs.existsSync(out)) || null, 3000),
             'temporary or published file survived the signal');
     } finally {
         child.kill();

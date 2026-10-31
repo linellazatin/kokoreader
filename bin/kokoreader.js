@@ -484,7 +484,7 @@ function warnOnce(message) {
 let activeFfmpeg = null;
 let activeFfplay = null;
 let activeWorker = null;
-let activePartFile = null;
+let activeExportDirectory = null;
 let activeEncoder = null;
 let stopping = false;
 let cleanupPromise = null;
@@ -513,7 +513,7 @@ function killActive() {
     playbackPaused = false;
     // Wait for owned file handles to close before removing encoder output.
     cleanupPromise = Promise.race([Promise.allSettled(closing), delay(WORKER_SHUTDOWN_MS + 500)]).then(() => {
-        if (activePartFile) { try { fs.unlinkSync(activePartFile); } catch (_) {} activePartFile = null; }
+        if (activeExportDirectory) { try { fs.rmSync(activeExportDirectory, { recursive: true, force: true }); } catch (_) {} activeExportDirectory = null; }
     });
     return cleanupPromise;
 }
@@ -615,12 +615,19 @@ function startSaveEncoder(cfg, sampleRate) {
     // One encoder for the whole document, fed as paragraphs are synthesized: the
     // old design buffered every paragraph and encoded at the end, which cost
     // ~1.65 MB per spoken minute and lost all work if anything failed late.
-    const temporary = `${cfg.OUTPUT_FILE}.part`;
-    activePartFile = temporary;
+    const directory = fs.mkdtempSync(path.join(path.dirname(cfg.OUTPUT_FILE), '.kokoreader-export-'));
+    const temporary = path.join(directory, 'audio.part');
+    activeExportDirectory = directory;
+    const cleanup = () => {
+        try { fs.rmSync(directory, { recursive: true, force: true }); } catch (_) {}
+        if (activeExportDirectory === directory) activeExportDirectory = null;
+    };
     const args = ['-y', '-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg)];
     if (cfg.SAMPLE_RATE) args.push('-ar', String(cfg.SAMPLE_RATE));
     args.push('-f', cfg.FORMAT, temporary);
-    const ffmpeg = activeFfmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'pipe'] });
+    let ffmpeg;
+    try { ffmpeg = activeFfmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'pipe'] }); }
+    catch (error) { cleanup(); throw error; }
     ffmpeg.stdin.on('error', () => {});
     const diagnostic = collectStderr(ffmpeg.stderr);
     let cancelled = false, exited = false, killTimer = null, failure = null;
@@ -631,6 +638,8 @@ function startSaveEncoder(cfg, sampleRate) {
         if (activeEncoder?.stdin === ffmpeg.stdin) activeEncoder = null;
         resolve();
     }));
+    // Close listeners below publish synchronously before this cleanup microtask.
+    closed.then(cleanup);
     ffmpeg.once('spawn', () => { if (cancelled) { try { ffmpeg.kill(); } catch (_) {} } });
     const done = new Promise((resolve, reject) => {
         ffmpeg.on('error', reject);
@@ -642,13 +651,13 @@ function startSaveEncoder(cfg, sampleRate) {
                 return reject(new Error(status + (detail ? `: ${detail}` : '')));
             }
             if (!fs.existsSync(temporary)) return reject(new Error(`ffmpeg produced no audio for ${cfg.OUTPUT_FILE}`));
-            try { fs.renameSync(temporary, cfg.OUTPUT_FILE); if (activePartFile === temporary) activePartFile = null; resolve(); }
+            try { fs.renameSync(temporary, cfg.OUTPUT_FILE); resolve(); }
             catch (error) { reject(error); }
         });
     });
-    // Publish atomically: a failed read must leave the previous file alone, and
-    // the killed encoder must not leave a stray .part behind.
-    done.catch(error => { if (!cancelled) failure = error; try { fs.unlinkSync(temporary); } catch (_) {} });
+    // Publish atomically, then remove only this operation's private directory
+    // after encoder handles close. A failed read leaves the previous file alone.
+    done.catch(error => { if (!cancelled) failure = error; });
     return activeEncoder = {
         stdin: ffmpeg.stdin,
         done,
