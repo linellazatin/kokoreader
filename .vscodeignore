@@ -1,25 +1,12 @@
-*.conf
-*.sampleconf
-config/kokoreader.conf
-.gitignore
-.github
-*.vsix
-.DS_Store
-AGENTS.md
-
-## build caches
-__pycache__/
-**/__pycache__/**
-*model*/
-**/*.onnx
-**/*.bin
-**/*.download
-
-## non-essential locals
-test/
-docs/
-research*/
-
-## personal tools
-.nanomneme/
-.su*/
+# Ship only the distribution files. Add new runtime files explicitly.
+**/*
+!package.json
+!LICENSE
+!README.md
+!CHANGELOG.md
+!bin/kokoreader.js
+!config/kokoreader.sampleconf
+!extension/extension.js
+!images/openlines.png
+!python/kokoro_worker.py
+!python/requirements.txt

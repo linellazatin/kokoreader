@@ -6,6 +6,7 @@ const fs = require('fs');
 const Module = require('module');
 const os = require('os');
 const path = require('path');
+const vm = require('vm');
 
 const ROOT = path.resolve(__dirname, '..');
 const CLI = path.join(ROOT, 'bin', 'kokoreader.js');
@@ -33,6 +34,7 @@ function extensionHarness(activeEditor, options = {}) {
     const spawned = [];
     const contexts = [];
     const errors = [];
+    const information = [];
     const statusItems = [];
     const uri = file => ({ fsPath: file, scheme: 'file', toString: () => `file://${file}` });
     const vscode = {
@@ -51,7 +53,7 @@ function extensionHarness(activeEditor, options = {}) {
                 return item;
             },
             showSaveDialog: options.showSaveDialog || (async () => uri('/tmp/kokoreader-output.wav')),
-            showErrorMessage(message) { errors.push(message); }, showInformationMessage() {},
+            showErrorMessage(message) { errors.push(message); }, showInformationMessage(message) { information.push(message); },
         },
     };
     const originalLoad = Module._load;
@@ -61,7 +63,10 @@ function extensionHarness(activeEditor, options = {}) {
         if (request === 'vscode') return vscode;
         if (request === 'child_process') return { spawn: (command, args, options) => {
             const child = new EventEmitter();
-            child.stdin = { write() {} }; child.stderr = new EventEmitter(); child.kill = () => {};
+            child.stdin = new EventEmitter(); child.stdin.writes = [];
+            child.stdin.write = text => { child.stdin.writes.push(text); };
+            child.stderr = new EventEmitter(); child.kills = [];
+            child.kill = signal => { child.kills.push(signal); child.emit('close', null, signal || 'SIGTERM'); return true; };
             spawned.push({ command, args, options, child });
             return child;
         } };
@@ -74,7 +79,7 @@ function extensionHarness(activeEditor, options = {}) {
             extensionPath: options.extensionPath || path.join(ROOT, 'extension'),
             logUri: uri(options.logPath || path.join(os.tmpdir(), 'kokoreader-test-logs')),
         });
-        return { commands, spawned, contexts, errors, statusItems, extension, uri };
+        return { commands, spawned, contexts, errors, information, statusItems, extension, uri };
     } finally {
         Module._load = originalLoad;
         delete require.cache[extensionPath];
@@ -112,6 +117,7 @@ const events = ${JSON.stringify(paths.events)};
 const delay = Number(process.env.KKR_STUB_SYNTH_DELAY || 0);
 fs.appendFileSync(events, JSON.stringify({ tool: 'worker', pid: process.pid }) + '\\n');
 const ready = () => {
+  if (process.env.KKR_STUB_STARTUP_ERROR) { process.stderr.end(process.env.KKR_STUB_STARTUP_ERROR, () => process.exit(1)); return; }
   fs.appendFileSync(events, JSON.stringify({ tool: 'worker-ready', at: Date.now() }) + '\\n');
   process.stdout.write(JSON.stringify({ ready: true }) + '\\n');
 };
@@ -121,8 +127,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   const request = JSON.parse(line);
   fs.appendFileSync(events, JSON.stringify({ ...request, at: Date.now() }) + '\\n');
   const send = () => {
+    fs.appendFileSync(events, JSON.stringify({ tool: 'worker-response', id: request.id, at: Date.now() }) + '\\n');
     if (request.action === 'prepare') {
-      const units = process.env.KKR_STUB_UNITS ? JSON.parse(process.env.KKR_STUB_UNITS) : [request.text];
+      const byText = process.env.KKR_STUB_UNITS_BY_TEXT ? JSON.parse(process.env.KKR_STUB_UNITS_BY_TEXT) : {};
+      const units = byText[request.text] || (process.env.KKR_STUB_UNITS ? JSON.parse(process.env.KKR_STUB_UNITS) : [request.text]);
       process.stdout.write(JSON.stringify({ id: request.id, units, warning: process.env.KKR_STUB_WARNING || undefined }) + '\\n');
     } else if ((process.env.KKR_STUB_FAIL_TEXT && request.text && request.text.includes(process.env.KKR_STUB_FAIL_TEXT)) ||
                (process.env.KKR_STUB_FAIL_PHONEMES && request.phonemes && request.phonemes.includes(process.env.KKR_STUB_FAIL_PHONEMES))) {
@@ -134,7 +142,11 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     } else if (request.action === 'list') {
       process.stdout.write(JSON.stringify({ id: request.id, voices: ['af_heart'] }) + '\\n');
     } else {
-      process.stdout.write(JSON.stringify({ id: request.id, pcm: process.env.KKR_STUB_PCM, sampleRate: 24000, warning: process.env.KKR_STUB_WARNING || undefined }) + '\\n');
+      const byPhoneme = process.env.KKR_STUB_PCM_BY_PHONEME ? JSON.parse(process.env.KKR_STUB_PCM_BY_PHONEME) : {};
+      const pcm = process.env.KKR_STUB_PCM_SAMPLES
+        ? Buffer.alloc(Number(process.env.KKR_STUB_PCM_SAMPLES) * 2, byPhoneme[request.phonemes]).toString('base64')
+        : byPhoneme[request.phonemes] || process.env.KKR_STUB_PCM;
+      process.stdout.write(JSON.stringify({ id: request.id, pcm, sampleRate: 24000, warning: process.env.KKR_STUB_WARNING || undefined }) + '\\n');
     }
   };
   delay ? setTimeout(send, delay) : send();
@@ -142,15 +154,26 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
 `);
     fs.writeFileSync(path.join(paths.tools, 'ffmpeg'), `#!/usr/bin/env node
 const fs = require('fs');
-fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffmpeg', args: process.argv.slice(2) }) + '\\n');
+fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffmpeg', pid: process.pid, args: process.argv.slice(2) }) + '\\n');
 const out = process.argv[process.argv.length - 1];
 const sink = /^pipe:/.test(out) ? null : out;
+if (sink && process.env.KKR_STUB_ENCODER_IGNORE_TERM) process.on('SIGTERM', () => {});
+if (sink && process.env.KKR_STUB_ENCODER_TERM_SUCCESS) process.on('SIGTERM', () => process.exit(0));
+if (sink && process.env.KKR_STUB_ENCODER_FAIL_EARLY) process.stderr.end(process.env.KKR_STUB_ENCODER_ERROR, () => process.exit(1));
 process.stdin.on('data', chunk => { if (sink) fs.appendFileSync(sink, chunk); else process.stdout.write(chunk); });
-process.stdin.on('end', () => process.exit(0));
+process.stdin.on('end', () => {
+  fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffmpeg-end', pid: process.pid }) + '\\n');
+  if (sink && process.env.KKR_STUB_ENCODER_ERROR) { process.stderr.end(process.env.KKR_STUB_ENCODER_ERROR, () => process.exit(1)); return; }
+  const hold = sink && Number(process.env.KKR_STUB_ENCODER_HOLD_MS || 0);
+  hold ? setTimeout(() => process.exit(0), hold) : process.exit(0);
+});
 `);
     fs.writeFileSync(path.join(paths.tools, 'ffplay'), `#!/usr/bin/env node
 const fs = require('fs');
 fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffplay', pid: process.pid, at: Date.now() }) + '\\n');
+const chunks = [];
+process.stdin.on('data', chunk => chunks.push(chunk));
+process.stdin.on('end', () => fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffplay-input', pid: process.pid, pcm: Buffer.concat(chunks).toString('base64') }) + '\\n'));
 const hold = Number(process.env.KKR_STUB_FFPLAY_HOLD_MS || 0);
 if (hold) setTimeout(() => { fs.appendFileSync(${JSON.stringify(paths.events)}, JSON.stringify({ tool: 'ffplay-exit', pid: process.pid, at: Date.now() }) + '\\n'); process.exit(0); }, hold);
 else if (process.env.KKR_STUB_FFPLAY_HOLD === '0') process.stdin.on('end', () => process.exit(0));
@@ -169,6 +192,11 @@ function stubEnv(paths) {
 function stubEvents(paths) {
     if (!fs.existsSync(paths.events)) return [];
     return fs.readFileSync(paths.events, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+}
+
+function exportDirectories(output) {
+    const directory = path.dirname(output);
+    return fs.readdirSync(directory).filter(name => name.startsWith('.kokoreader-export-')).map(name => path.join(directory, name));
 }
 
 function sleepSync(ms) {
@@ -192,6 +220,105 @@ function isAlive(pid) {
 function cliArgs(paths) {
     return ['--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices];
 }
+
+function liveProbe(paths, env, scenario, args = []) {
+    const probe = `
+const { spawn } = require('child_process');
+const fs = require('fs');
+const paths = JSON.parse(process.argv[2]);
+const events = () => fs.existsSync(paths.events) ? fs.readFileSync(paths.events, 'utf8').split('\\n').filter(Boolean).map(JSON.parse) : [];
+const syntheses = () => events().filter(event => !event.tool && event.action === 'synthesize');
+const players = () => events().filter(event => event.tool === 'ffplay');
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const alive = pid => { try { process.kill(pid, 0); return true; } catch (_) { return false; } };
+const wait = async check => {
+  const deadline = Date.now() + 6000;
+  while (!check()) { if (Date.now() >= deadline) throw new Error('condition timed out'); await sleep(25); }
+};
+(async () => {
+  const child = spawn(process.execPath, [process.argv[1], '--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices, ...JSON.parse(process.argv[3]), paths.input], { stdio: ['pipe', 'ignore', 'pipe'] });
+  let exited = null, stderr = '';
+  child.on('exit', (code, signal) => { exited = { code, signal }; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  try {
+    ${scenario}
+  } catch (error) { throw new Error(error.message + ': ' + stderr + ' events=' + JSON.stringify(events())); }
+  finally { child.kill(); await wait(() => exited); }
+})().then(() => process.exit(0), error => { console.error(error.message); process.exit(1); });
+`;
+    const result = spawnSync(process.execPath, ['-e', probe, CLI, JSON.stringify(paths), JSON.stringify(args)], {
+        encoding: 'utf8', timeout: 15000, env: { ...process.env, ...stubEnv(paths), ...env },
+    });
+    assert(result.status === 0, `live probe failed: ${result.stderr}`);
+}
+
+function downloadHarness(transport, getError, configure, pipelineImpl) {
+    const { PassThrough } = require('stream');
+    const crypto = require('crypto');
+    const payloads = { 'kokoro-v1.0.onnx': Buffer.from('offline model fixture'), 'voices-v1.0.bin': Buffer.from('offline voice fixture') };
+    const files = [], writers = [];
+    const https = { get(url, callback) {
+        if (getError) throw getError;
+        const request = new EventEmitter();
+        let response;
+        request.setTimeout = () => request;
+        request.destroy = error => { request.destroyed = true; request.emit('error', error); response?.destroy(error); };
+        setImmediate(() => {
+            if (request.destroyed) return;
+            const payload = payloads[path.basename(new URL(url).pathname)];
+            response = new PassThrough();
+            response.statusCode = 200;
+            response.headers = { 'content-length': String(payload.length) };
+            configure?.(response, url);
+            callback(response);
+            transport ? transport(response, payload, request) : response.end(payload);
+        });
+        return request;
+    } };
+    const source = fs.readFileSync(CLI, 'utf8');
+    const context = { require: name => name === 'https' ? https : name === 'stream' && pipelineImpl ? { ...require(name), pipeline: pipelineImpl } : name === 'fs' ? { ...fs, createWriteStream(file, ...args) {
+        files.push(file); const writer = fs.createWriteStream(file, ...args); writers.push(writer); return writer;
+    } } : require(name), Buffer, setTimeout, clearTimeout, URL, __dirname: path.dirname(CLI), module: { exports: {} },
+        process: { env: {}, on() {}, stdout: { write() {} }, stderr: { write() {} } } };
+    vm.runInNewContext(source.slice(0, source.lastIndexOf('\nmain().catch(')) + '\nmodule.exports = { downloadAssets, killActive, ASSET_SHA256 };', context, { filename: CLI });
+    for (const [name, payload] of Object.entries(payloads)) context.module.exports.ASSET_SHA256[name] = crypto.createHash('sha256').update(payload).digest('hex');
+    return { ...context.module.exports, payloads, files, writers };
+}
+
+function playbackHarness(play) {
+    const source = fs.readFileSync(CLI, 'utf8');
+    const entry = source.lastIndexOf('\nmain().catch(');
+    assert(entry > 0, 'CLI entry point not found');
+    const context = { require, Buffer, setTimeout, clearTimeout, __dirname: path.dirname(CLI),
+        module: { exports: {} }, process: { env: {}, on() {}, stderr: { write() {} } }, play };
+    // Test the real controller with only its audio boundary replaced; no shipped test API.
+    vm.runInNewContext(source.slice(0, entry) + '\nplayPCM = play; module.exports = { PlaybackController };', context, { filename: CLI });
+    return context.module.exports.PlaybackController;
+}
+
+for (const [electron, appName, legacy] of [
+    ['', 'Visual Studio Code', false], ['19.1.9', 'Visual Studio Code', true],
+    ['27.1.3', 'Visual Studio Code', true], ['27.2.1', 'Visual Studio Code', false],
+    ['43.8.3', 'Visual Studio Code', false], ['19.1.9', 'VSCodium', false],
+]) run(`${electron ? `${appName} Electron ${electron}` : 'plain Node'} editor host preserves the correct CLI bootstrap`, () => {
+    const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
+    const calls = [], child = {};
+    const host = { execPath: '/editor/node', versions: electron ? { electron } : {}, env: { KEEP: 'host environment', ELECTRON_RUN_AS_NODE: '0' } };
+    const context = { require: name => name === 'vscode' ? { env: { appName } } : name === 'child_process' ? { spawn(...args) { calls.push(args); return child; } } : require(name),
+        process: host, __dirname: path.join(ROOT, 'extension'), module: { exports: {} } };
+    vm.runInNewContext(source + '\nmodule.exports = { spawnCli };', context);
+    const options = { stdio: ['pipe', 'ignore', 'pipe'] };
+    assert(context.module.exports.spawnCli(['--help'], options) === child, 'bootstrap did not return the reader process');
+    const [executable, args, spawnedOptions] = calls[0];
+    const expected = [CLI, '--help'];
+    if (legacy) expected.unshift('--ms-enable-electron-run-as-node');
+    assert(executable === host.execPath && JSON.stringify(args) === JSON.stringify(expected), 'editor CLI bootstrap arguments were incorrect');
+    if (electron) {
+        assert(spawnedOptions.env.KEEP === host.env.KEEP && spawnedOptions.env.ELECTRON_RUN_AS_NODE === '1', 'Electron launch did not preserve environment and enable Node mode');
+        assert(spawnedOptions.stdio === options.stdio && !options.env && host.env.ELECTRON_RUN_AS_NODE === '0', 'bootstrap mutated caller options or host environment');
+    } else assert(spawnedOptions === options, 'plain Node launch options changed');
+});
 
 run('--help describes the Kokoro reader CLI', () => {
     const result = cli(['--help']);
@@ -327,6 +454,14 @@ run('extension manifest exposes read, playback, and save commands', () => {
     }
 });
 
+run('extension explicitly requires trust without changing the editor minimum', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    const policy = manifest.capabilities && manifest.capabilities.untrustedWorkspaces;
+    assert(policy && policy.supported === false, 'Restricted Mode is not explicitly unsupported');
+    assert(typeof policy.description === 'string' && policy.description.includes('Python') && policy.description.includes('model'), 'trust requirement does not explain executable and model selection');
+    assert(manifest.engines.vscode === '^1.75.0', 'trust declaration changed the editor minimum');
+});
+
 run('extension save command and format setting are format-neutral', () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
     const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
@@ -384,6 +519,12 @@ run('runtime source uses the organized project layout', () => {
     assert(!fs.existsSync(path.join(ROOT, 'extension.js')), 'extension remains at the project root');
 });
 
+run('Python requirements pin the approved adapter and ONNX Runtime baseline', () => {
+    const requirements = fs.readFileSync(path.join(ROOT, 'python', 'requirements.txt'), 'utf8').split(/\r?\n/);
+    assert(requirements.includes('kokoro-onnx==0.4.7'), 'adapter pin changed');
+    assert(requirements.includes('onnxruntime==1.28.0'), 'secure ONNX Runtime baseline is not pinned');
+});
+
 run('CLI loads its default config from the config directory', () => {
     const source = fs.readFileSync(path.join(ROOT, 'bin', 'kokoreader.js'), 'utf8');
     assert(source.includes("path.join(__dirname, '..', 'config', 'kokoreader.conf')"), 'default config is not in config/kokoreader.conf');
@@ -392,14 +533,25 @@ run('CLI loads its default config from the config directory', () => {
 run('GitHub workflows validate pull requests separately from tagged releases', () => {
     const validate = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'validate.yml'), 'utf8');
     const release = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
-    for (const fragment of ['pull_request:', 'permissions:\n      contents: read', 'npm test', 'node --check bin/kokoreader.js', 'python3 -m py_compile python/kokoro_worker.py', '@vscode/vsce@4.0.0', 'vsce package']) {
+    for (const fragment of ['pull_request:', 'permissions:\n      contents: read', 'npm test', 'node --check bin/kokoreader.js', 'python3 -m py_compile python/kokoro_worker.py', '@vscode/vsce@4.0.0', 'node test/package.js', 'vsce package']) {
         assert(validate.includes(fragment), `missing PR validation step: ${fragment}`);
     }
     assert(!validate.includes('actions/upload-artifact'), 'PR validation retains an unused artifact upload');
-    for (const fragment of ["tags:\n      - 'v*'", 'needs: validate', 'actions/upload-artifact', 'actions/download-artifact', 'publish release/kokoreader.vsix', 'softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65']) {
+    for (const fragment of ["tags:\n      - 'v*'", 'needs: validate', 'actions/upload-artifact', 'actions/download-artifact', 'node test/package.js', 'publish release/kokoreader.vsix', 'softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65']) {
         assert(release.includes(fragment), `missing release workflow step: ${fragment}`);
     }
     assert(!release.includes('pull_request:'), 'release workflow still handles pull requests');
+});
+
+run('CI uses Node 22 for validation and the existing publishing tool', () => {
+    for (const [file, count] of [['validate.yml', 1], ['main.yml', 2]]) {
+        const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', file), 'utf8');
+        const versions = [...workflow.matchAll(/node-version: '([^']+)'/g)].map(match => match[1]);
+        assert(versions.length === count && versions.every(version => version === '22'), `${file} does not consistently use Node 22, required by ovsx 1.2.0`);
+        assert(workflow.includes('@vscode/vsce@4.0.0'), 'packaging tool pin changed');
+    }
+    const release = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
+    assert(release.includes('ovsx@1.2.0'), 'publishing tool pin changed');
 });
 
 run('GitHub Actions are pinned to immutable revisions', () => {
@@ -417,13 +569,15 @@ run('GitHub Actions are pinned to immutable revisions', () => {
 
 run('local CLI configuration is excluded from VSIX packages', () => {
     const ignore = fs.readFileSync(path.join(ROOT, '.vscodeignore'), 'utf8');
-    assert(ignore.split(/\r?\n/).includes('config/kokoreader.conf'), 'config/kokoreader.conf is not excluded');
+    const rules = ignore.split(/\r?\n/);
+    assert(rules.includes('**/*') && !rules.includes('!config/kokoreader.conf'), 'local CLI configuration is not excluded by the distribution allowlist');
 });
 
 run('local model assets are excluded from VSIX packages', () => {
     const ignore = fs.readFileSync(path.join(ROOT, '.vscodeignore'), 'utf8').split(/\r?\n/);
-    for (const pattern of ['**/*.onnx', '**/*.bin', '**/*.download', '**/__pycache__/**']) {
-        assert(ignore.includes(pattern), `${pattern} is not excluded`);
+    assert(ignore.includes('**/*'), 'local model assets are not excluded by default');
+    for (const file of ['kkr-models/kokoro-v1.0.onnx', 'kkr-models/voices-v1.0.bin', 'kkr-models/asset.download', 'python/__pycache__/kokoro_worker.pyc']) {
+        assert(!ignore.includes(`!${file}`), `${file} is explicitly included`);
     }
 });
 
@@ -577,7 +731,7 @@ run('export failures always append an extension error record', async () => {
     }, { extensionPath });
     try {
         await harness.commands.get('kokoreader.saveFile')();
-        harness.spawned[0].child.emit('exit', 1);
+        harness.spawned[0].child.emit('close', 1);
         const log = path.join(extensionPath, 'logs', 'err.jsonl');
         assert(fs.existsSync(log), 'debug export failure did not create err.jsonl');
         const entry = JSON.parse(fs.readFileSync(log, 'utf8'));
@@ -658,8 +812,11 @@ run('save path streams each paragraph into one encoder without waiting for the d
     child.stderr.resume();
     child.once('exit', () => {});
     try {
-        const halfway = waitFor(() => (fs.existsSync(`${out}.part`)
-            && fs.statSync(`${out}.part`).size === Buffer.from(STUB_PCM, 'base64').length) || null);
+        const halfway = waitFor(() => {
+            const args = stubEvents(paths).find(event => event.tool === 'ffmpeg')?.args;
+            const temporary = args && args[args.length - 1];
+            return temporary && fs.existsSync(temporary) && fs.statSync(temporary).size === Buffer.from(STUB_PCM, 'base64').length;
+        });
         assert(halfway, 'first paragraph never reached the encoder while the second was still synthesizing');
         assert(!fs.existsSync(out), 'final output was published before the document finished');
         assert(waitFor(() => (fs.existsSync(out) && fs.statSync(out).size === 2 * Buffer.from(STUB_PCM, 'base64').length + 24000 * 2 * 0.8) || null, 8000),
@@ -678,7 +835,142 @@ run('save path encodes once and publishes only on success', () => {
     const encodes = stubEvents(paths).filter(event => event.tool === 'ffmpeg');
     fs.rmSync(paths.dir, { recursive: true, force: true });
     assert(encodes.length === 1, `expected one ffmpeg encode for the document, saw ${encodes.length}`);
-    assert(encodes[0].args[encodes[0].args.length - 1] === `${out}.part`, 'encoder did not write a temporary file');
+    const temporary = encodes[0].args[encodes[0].args.length - 1];
+    assert(path.dirname(path.dirname(temporary)) === paths.dir && path.dirname(temporary) !== paths.dir, 'encoder did not write inside a sibling private directory');
+});
+
+run('export preserves a preexisting sibling part file', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    fs.writeFileSync(output + '.part', 'unrelated partial file');
+    try {
+        const result = cli([...cliArgs(paths), '--output', output, paths.input], { env: stubEnv(paths) });
+        assert(result.status === 0, result.stderr);
+        assert(fs.existsSync(output + '.part') && fs.readFileSync(output + '.part', 'utf8') === 'unrelated partial file', 'preexisting sibling part file was changed or removed');
+        assert(fs.lstatSync(output).isFile(), 'export did not publish a regular file');
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('export does not follow a preexisting sibling part symlink', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    const sentinel = path.join(paths.dir, 'sentinel');
+    fs.writeFileSync(sentinel, 'unrelated sentinel');
+    fs.symlinkSync(sentinel, output + '.part');
+    try {
+        const result = cli([...cliArgs(paths), '--output', output, paths.input], { env: stubEnv(paths) });
+        assert(result.status === 0, result.stderr);
+        assert(fs.readFileSync(sentinel, 'utf8') === 'unrelated sentinel', 'sibling symlink target was overwritten');
+        assert(fs.lstatSync(output + '.part').isSymbolicLink() && fs.lstatSync(output).isFile(), 'export moved the unrelated symlink instead of publishing owned audio');
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('concurrent exports use separate private paths and publish complete outputs', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    const otherPCM = Buffer.alloc(20, 2);
+    try {
+        liveProbe(paths, { KKR_STUB_ENCODER_HOLD_MS: '1500' }, `
+    const path = require('path');
+    const second = spawn(process.execPath, [process.argv[1], '--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices, '--output', ${JSON.stringify(output)}, paths.input], {
+        stdio: ['pipe', 'ignore', 'pipe'], env: { ...process.env, KKR_STUB_PCM: ${JSON.stringify(otherPCM.toString('base64'))} }
+    });
+    second.stderr.resume();
+    let secondExit = null;
+    second.on('close', code => { secondExit = { code }; });
+    try {
+        await wait(() => events().filter(event => event.tool === 'ffmpeg').length === 2);
+        const files = events().filter(event => event.tool === 'ffmpeg').map(event => event.args[event.args.length - 1]);
+        assert(new Set(files).size === 2, 'concurrent encoders shared a temporary path');
+        for (const file of files) {
+            const directory = path.dirname(file);
+            assert(path.dirname(directory) === paths.dir && directory !== paths.dir, 'temporary output was not inside a sibling directory');
+            assert((fs.statSync(directory).mode & 0o777) === 0o700, 'temporary directory was not private');
+        }
+        await wait(() => exited && secondExit);
+        assert(exited.code === 0 && secondExit.code === 0, 'a concurrent publisher failed');
+        const gap = Buffer.alloc(24000 * 2 * 0.8);
+        const left = Buffer.from(${JSON.stringify(STUB_PCM)}, 'base64');
+        const right = Buffer.from(${JSON.stringify(otherPCM.toString('base64'))}, 'base64');
+        const actual = fs.readFileSync(${JSON.stringify(output)});
+        assert(actual.equals(Buffer.concat([left, gap, left])) || actual.equals(Buffer.concat([right, gap, right])), 'concurrent publication mixed or truncated audio');
+        assert(files.every(file => !fs.existsSync(path.dirname(file))), 'completed export left its private directory');
+    } finally { second.kill(); await wait(() => secondExit); }
+`, ['--output', output]);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('cancelling one concurrent export preserves the other private output', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    fs.writeFileSync(output, 'previous output');
+    const otherPCM = Buffer.alloc(20, 2);
+    try {
+        liveProbe(paths, { KKR_STUB_ENCODER_HOLD_MS: '4000' }, `
+    const path = require('path');
+    const second = spawn(process.execPath, [process.argv[1], '--python-path', paths.worker, '--model', paths.model, '--voices', paths.voices, '--output', ${JSON.stringify(output)}, paths.input], {
+        stdio: ['pipe', 'ignore', 'pipe'], env: { ...process.env, KKR_STUB_PCM: ${JSON.stringify(otherPCM.toString('base64'))} }
+    });
+    second.stderr.resume();
+    let secondExit = null;
+    second.on('close', code => { secondExit = { code }; });
+    try {
+        await wait(() => events().filter(event => event.tool === 'ffmpeg-end').length === 2);
+        const files = events().filter(event => event.tool === 'ffmpeg').map(event => event.args[event.args.length - 1]);
+        child.stdin.write('stop\\n');
+        await wait(() => exited);
+        assert(fs.readFileSync(${JSON.stringify(output)}, 'utf8') === 'previous output', 'cancelled export replaced the previous output');
+        const surviving = files.filter(file => fs.existsSync(path.dirname(file)));
+        assert(surviving.length === 1 && fs.existsSync(surviving[0]), 'cancellation removed another export or retained its own directory');
+        await wait(() => secondExit);
+        assert(secondExit.code === 0, 'remaining export failed');
+        const pcm = Buffer.from(${JSON.stringify(otherPCM.toString('base64'))}, 'base64');
+        assert(fs.readFileSync(${JSON.stringify(output)}).equals(Buffer.concat([pcm, Buffer.alloc(38400), pcm])), 'remaining publication was contaminated');
+        assert(files.every(file => !fs.existsSync(path.dirname(file))), 'concurrent cleanup left private output');
+    } finally { second.kill(); await wait(() => secondExit); }
+`, ['--output', output]);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('encoder spawn failure removes its private directory and preserves prior output', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    fs.writeFileSync(output, 'previous output');
+    fs.unlinkSync(path.join(paths.tools, 'ffmpeg'));
+    fs.symlinkSync(process.execPath, path.join(paths.tools, 'node'));
+    try {
+        const result = cli([...cliArgs(paths), '--output', output, paths.input], { env: { ...stubEnv(paths), PATH: paths.tools } });
+        assert(result.status !== 0 && result.stderr.includes('ENOENT'), 'missing encoder did not fail explicitly');
+        assert(fs.readFileSync(output, 'utf8') === 'previous output' && exportDirectories(output).length === 0, 'spawn failure changed prior output or leaked its private directory');
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('synchronous encoder setup failure removes its allocated private directory', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'out.wav');
+    const source = fs.readFileSync(CLI, 'utf8');
+    const context = { require: name => name === 'child_process' ? { spawn() { throw new Error('synchronous spawn failure'); } } : require(name),
+        Buffer, setTimeout, clearTimeout, __dirname: path.dirname(CLI), module: { exports: {} }, process: { env: {}, on() {}, stderr: { write() {} } } };
+    try {
+        vm.runInNewContext(source.slice(0, source.lastIndexOf('\nmain().catch(')) + '\nmodule.exports = { startSaveEncoder };', context, { filename: CLI });
+        let failure;
+        try { context.module.exports.startSaveEncoder({ OUTPUT_FILE: output, FORMAT: 'wav', VOLUME: 1, GAIN: 0, TEMPO: 1, LIMITER: true }, 24000); }
+        catch (error) { failure = error; }
+        assert(failure?.message === 'synchronous spawn failure' && exportDirectories(output).length === 0, 'synchronous encoder setup leaked its private directory');
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('failed export publication preserves the destination and removes private output', () => {
+    const paths = stubs();
+    const output = path.join(paths.dir, 'existing-directory');
+    const sentinel = path.join(output, 'sentinel');
+    fs.mkdirSync(output);
+    fs.writeFileSync(sentinel, 'unrelated sentinel');
+    try {
+        const result = cli([...cliArgs(paths), '--output', output, paths.input], { env: stubEnv(paths) });
+        assert(result.status !== 0, 'file publication over a directory unexpectedly succeeded');
+        assert(fs.readFileSync(sentinel, 'utf8') === 'unrelated sentinel' && exportDirectories(output).length === 0, 'failed rename changed the destination or leaked private output');
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
 });
 
 run('failed synthesis leaves the previous output file untouched', () => {
@@ -688,7 +980,7 @@ run('failed synthesis leaves the previous output file untouched', () => {
     const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), '--output', out, paths.input],
         { env: { ...process.env, ...stubEnv(paths), KKR_STUB_FAIL_PHONEMES: 'Second' } });
     const untouched = fs.existsSync(out) && fs.readFileSync(out, 'utf8') === 'previous';
-    const noPartial = !fs.existsSync(`${out}.part`);
+    const noPartial = exportDirectories(out).length === 0;
     fs.rmSync(paths.dir, { recursive: true, force: true });
     assert(result.status !== 0, 'failing synthesis unexpectedly succeeded');
     assert(untouched, 'partial audio replaced the previous output');
@@ -701,7 +993,7 @@ run('download is bounded by timeout, redirect depth, and transfer length', () =>
     assert(source.includes('setTimeout'), 'download has no stall timeout');
     assert(source.includes("response.headers['content-length']"), 'transfer length is never checked');
     assert(source.includes('new URL('), 'relative redirect locations are not resolved');
-    assert(source.includes('response.resume()'), 'discarded redirect bodies pin a socket');
+    assert(source.includes('response.destroy()'), 'discarded response bodies are not closed');
 });
 
 run('text comparisons are not mistaken for HTML tags', () => {
@@ -870,7 +1162,7 @@ run('extension saves current editor text through private temporary input', () =>
     assert(source.includes('function inputForEditor('), 'extension has no shared editor-input resolver');
     assert(source.includes('editor.document.getText(editor.selection)'), 'Save to File cannot use an active selection');
     assert(source.includes('editor.document.getText()'), 'Save to File cannot use unsaved editor content');
-    assert(source.includes('activeSaveTemporary'), 'Save to File temporary input is not lifecycle-managed');
+    assert(source.includes('cleanupTemporary(input.temporary)'), 'Save to File temporary input is not lifecycle-managed');
 });
 
 run('extension Read honors a context-menu target over another active editor', () => {
@@ -921,6 +1213,145 @@ run('extension commands cannot replace an active export through the Command Pale
     harness.commands.get('kokoreader.readFromCursor')();
     harness.extension.deactivate();
     assert(harness.spawned.length === 1, `commands replaced export with ${harness.spawned.length} processes`);
+});
+
+run('export Stop retains ownership until close and suppresses cancellation notifications', async () => {
+    const sourcePath = '/tmp/kokoreader-export-stop.md';
+    const harness = extensionHarness({ selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'unsaved text' } });
+    try {
+        await harness.commands.get('kokoreader.saveFile')();
+        const call = harness.spawned[0];
+        const input = call.args.at(-1);
+        const saving = () => harness.contexts.filter(args => args[1] === 'kokoreader.isSaving').at(-1)[2];
+        const stopped = harness.commands.get('kokoreader.stop')();
+        assert(Array.isArray(call.options.stdio) && call.options.stdio[0] === 'pipe', 'export has no cooperative stdin');
+        assert(call.child.stdin.writes.includes('stop\n') && call.child.kills.length === 0, 'Stop killed instead of requesting cleanup');
+        assert(fs.existsSync(input) && saving(), 'Stop released input or saving ownership before process close');
+        await harness.commands.get('kokoreader.saveFile')();
+        harness.commands.get('kokoreader.readFile')();
+        assert(harness.spawned.length === 1, 'new work overlapped the closing export');
+        harness.information.length = 0;
+        call.child.emit('exit', 0);
+        assert(fs.existsSync(input) && saving(), 'exit released ownership before stream closure');
+        call.child.emit('close', 0);
+        await stopped;
+        assert(!fs.existsSync(input) && !saving(), 'close did not release operation-owned input and saving state');
+        assert(harness.information.length === 0 && harness.errors.length === 0, 'cancelled export reported success or failure');
+        await harness.commands.get('kokoreader.saveFile')();
+        assert(harness.spawned.length === 2, 'new export could not start after cleanup');
+        harness.spawned[1].child.emit('close', 0);
+    } finally { await harness.extension.deactivate(); }
+});
+
+run('export Stop reaps worker and encoder and preserves prior output at every stage', () => {
+    for (const stage of ['startup', 'synthesis', 'encoding', 'encoding-success-exit', 'encoding-ignore-term']) {
+        const paths = stubs({ text: 'One paragraph.\n' });
+        const output = path.join(paths.dir, 'saved.wav');
+        fs.writeFileSync(output, 'previous output');
+        try {
+            const env = stage === 'startup' ? { KKR_STUB_READY_DELAY: '5000' } : stage === 'synthesis' ?
+                { KKR_STUB_SYNTH_DELAY: '700' } : { KKR_STUB_ENCODER_HOLD_MS: '10000',
+                    ...(stage === 'encoding-success-exit' ? { KKR_STUB_ENCODER_TERM_SUCCESS: '1' } : {}),
+                    ...(stage === 'encoding-ignore-term' ? { KKR_STUB_ENCODER_IGNORE_TERM: '1' } : {}) };
+            const reached = stage === 'startup' ? 'events().some(event => event.tool === "worker")' : stage === 'synthesis' ?
+                'syntheses().length === 1' : 'events().some(event => event.tool === "ffmpeg-end")';
+            liveProbe(paths, env, `
+    await wait(() => ${reached});
+    const pids = events().filter(event => event.tool === 'worker' || event.tool === 'ffmpeg').map(event => event.pid);
+    child.stdin.write('stop\\n');
+    await wait(() => exited && pids.every(pid => !alive(pid)));
+    assert(exited.code === 0, 'Stop did not exit successfully');
+    await sleep(200);
+    assert(fs.readFileSync(${JSON.stringify(output)}, 'utf8') === 'previous output', 'cancelled export replaced prior output');
+    assert(fs.readdirSync(paths.dir).every(name => !name.startsWith('.kokoreader-export-')), 'cancelled export left its private directory');
+`, ['--output', output]);
+        } finally {
+            for (const event of stubEvents(paths)) if (event.pid) { try { process.kill(event.pid, 'SIGKILL'); } catch (_) {} }
+            fs.rmSync(paths.dir, { recursive: true, force: true });
+        }
+    }
+});
+
+run('export deactivation waits for close and uses a bounded hard-kill fallback', async () => {
+    const sourcePath = '/tmp/kokoreader-export-deactivate.md';
+    const harness = extensionHarness({ selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'text' } });
+    await harness.commands.get('kokoreader.saveFile')();
+    const call = harness.spawned[0], input = call.args.at(-1);
+    const before = Date.now();
+    const stopped = harness.extension.deactivate();
+    assert(stopped && typeof stopped.then === 'function', 'deactivate did not return a cleanup promise');
+    assert(fs.existsSync(input) && call.child.kills.length === 0, 'deactivate released ownership before cooperative cleanup');
+    await stopped;
+    assert(call.child.kills.length === 1 && call.child.kills[0] === 'SIGKILL', 'unresponsive export did not receive one hard-kill fallback');
+    assert(Date.now() - before < 4500, 'fallback cleanup was not bounded');
+    assert(!fs.existsSync(input), 'deactivation did not remove private input after close');
+    assert(harness.errors.length === 0 && harness.information.length === 0, 'deactivation reported a user cancellation as success or failure');
+});
+
+run('exports surface setup, synthesis, and encoder diagnostics without debug', () => {
+    const cases = [
+        { env: { KKR_STUB_STARTUP_ERROR: "ModuleNotFoundError: No module named 'kokoro_onnx'" }, detail: "No module named 'kokoro_onnx'" },
+        { env: { KKR_STUB_FAIL_PHONEMES: 'One paragraph.' }, detail: 'stub synthesis failed' },
+        { env: { KKR_STUB_ENCODER_ERROR: 'noise '.repeat(10000) + "Unknown encoder 'libmp3lame'" }, detail: "Unknown encoder 'libmp3lame'" },
+        { env: { KKR_STUB_ENCODER_FAIL_EARLY: '1', KKR_STUB_ENCODER_ERROR: "Unknown encoder 'libmp3lame'", KKR_STUB_SYNTH_DELAY: '400' },
+            text: 'One paragraph.\n\nAnother.\n', detail: "Unknown encoder 'libmp3lame'" },
+    ];
+    for (const item of cases) {
+        const paths = stubs({ text: item.text || 'One paragraph.\n' }), output = path.join(paths.dir, 'saved.wav');
+        fs.writeFileSync(output, 'previous output');
+        try {
+            const result = cli([...cliArgs(paths), '--output', output, paths.input], { env: { ...stubEnv(paths), ...item.env } });
+            assert(result.status === 1 && result.stderr.includes(item.detail), `missing actionable error: ${result.stderr}`);
+            assert(result.stderr.length < 3000, 'CLI dumped unbounded diagnostic stderr without debug');
+            assert(fs.readFileSync(output, 'utf8') === 'previous output' && exportDirectories(output).length === 0, 'diagnostic failure published or retained partial output');
+        } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+    }
+});
+
+run('export diagnostics handle fragmented UTF-8 and post-exit drainage without persisting source', async () => {
+    for (const detail of ["No module named 'kokoro_onnx'", 'stub synthesis failed', "Unknown encoder 'libmp3lame'"]) {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-export-diagnostic-'));
+        const sourcePath = path.join(dir, 'input.md'), extensionPath = path.join(dir, 'extension');
+        const harness = extensionHarness({ selection: { isEmpty: true },
+            document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'PRIVATE-SOURCE' } }, { extensionPath });
+        try {
+            await harness.commands.get('kokoreader.saveFile')();
+            const call = harness.spawned[0];
+            const statuses = harness.statusItems.map(item => item.text);
+            assert(call.options.stdio[2] === 'pipe', 'export stderr is not captured');
+            call.child.stderr.emit('data', Buffer.from('noise '.repeat(10000)));
+            call.child.emit('exit', 1);
+            assert(harness.errors.length === 0, 'error was reported before final stream drainage');
+            const bytes = Buffer.from(`\r[1/1] synthesizing...Error: ${detail}: 编码失败 PRIVATE-DIAGNOSTIC`);
+            for (let index = 0; index < bytes.length; index += 3) call.child.stderr.emit('data', bytes.subarray(index, index + 3));
+            call.child.stderr.emit('end');
+            call.child.emit('close', 1);
+            assert(harness.errors.length === 1 && harness.errors[0].includes(detail) && harness.errors[0].includes('编码失败'), `missing or corrupt fragmented error: ${JSON.stringify(harness.errors)}`);
+            assert(harness.errors[0].length < 1100 && harness.information.length === 0, 'failure used an unbounded or success notification');
+            assert(JSON.stringify(harness.statusItems.map(item => item.text)) === JSON.stringify(statuses), 'diagnostic stderr changed playback progress');
+            const log = fs.readFileSync(path.join(extensionPath, 'logs', 'err.jsonl'), 'utf8');
+            assert(!log.includes('PRIVATE-SOURCE') && !log.includes('PRIVATE-DIAGNOSTIC') && !log.includes(detail), 'persistent log included source or raw diagnostics');
+            assert(!fs.existsSync(call.args.at(-1)), 'failure did not release private input');
+        } finally { await harness.extension.deactivate(); fs.rmSync(dir, { recursive: true, force: true }); }
+    }
+});
+
+run('export process errors report once and retain input until close', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-export-spawn-'));
+    const sourcePath = path.join(dir, 'input.md');
+    const harness = extensionHarness({ selection: { isEmpty: true },
+        document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'text' } }, { extensionPath: path.join(dir, 'extension') });
+    try {
+        await harness.commands.get('kokoreader.saveFile')();
+        const call = harness.spawned[0];
+        call.child.emit('error', new Error('spawn ENOENT'));
+        assert(fs.existsSync(call.args.at(-1)), 'process error released input before close');
+        call.child.emit('close', -2);
+        assert(harness.errors.length === 1 && harness.errors[0].includes('spawn ENOENT') && harness.information.length === 0, 'spawn failure was reported more than once');
+        assert(!fs.existsSync(call.args.at(-1)), 'spawn failure did not release input on close');
+    } finally { await harness.extension.deactivate(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 run('extension clears saving state when the Save dialog rejects', async () => {
@@ -1158,6 +1589,295 @@ run('live playback synthesizes the next unit before the current player exits', (
     }
 });
 
+run('live playback prefetches every same-paragraph unit in bounded PCM order', () => {
+    const paths = stubs({ text: 'One long paragraph.\n' });
+    const units = ['one', 'two', 'three'];
+    const pcm = Object.fromEntries(units.map((unit, index) => [unit, Buffer.alloc(8, index + 1).toString('base64')]));
+    try {
+        const result = spawnSync(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
+            encoding: 'utf8', timeout: 8000,
+            env: { ...process.env, ...stubEnv(paths), KKR_STUB_UNITS: JSON.stringify(units),
+                KKR_STUB_PCM_BY_PHONEME: JSON.stringify(pcm), KKR_STUB_SYNTH_DELAY: '80', KKR_STUB_FFPLAY_HOLD_MS: '400' },
+        });
+        assert(result.status === 0, `reader failed: ${result.stderr}`);
+        const events = stubEvents(paths);
+        const syntheses = events.filter(event => !event.tool && event.action === 'synthesize');
+        const plays = events.filter(event => event.tool === 'ffplay');
+        assert(JSON.stringify(syntheses.map(event => event.phonemes)) === JSON.stringify(units), 'units were not synthesized once in order');
+        assert(plays.length === 3, `expected three players, got ${plays.length}`);
+        assert(JSON.stringify(plays.map(play => events.find(event => event.tool === 'ffplay-input' && event.pid === play.pid)?.pcm)) ===
+            JSON.stringify(units.map(unit => pcm[unit])), 'played PCM was missing, duplicated, or reordered');
+        for (let index = 0; index < 2; index++) {
+            const exit = events.find(event => event.tool === 'ffplay-exit' && event.pid === plays[index].pid);
+            assert(syntheses[index + 1].at < exit.at, `unit ${index + 2} was not synthesized during current playback`);
+            assert(plays[index + 1].at - exit.at < 700, 'same-paragraph units received an extra paragraph gap');
+        }
+        const firstExit = events.find(event => event.tool === 'ffplay-exit' && event.pid === plays[0].pid);
+        assert(syntheses[2].at >= firstExit.at, 'prefetch ran more than one unit ahead');
+        const inFlight = new Set();
+        for (const event of events) {
+            if (event.tool === 'worker-response') inFlight.delete(event.id);
+            else if (event.action === 'synthesize') inFlight.add(event.id);
+            assert(inFlight.size <= 1, 'model inference requests overlapped');
+        }
+        assert(events.filter(event => event.tool === 'worker').length === 1, 'prefetch started another model worker');
+    } finally {
+        fs.rmSync(paths.dir, { recursive: true, force: true });
+    }
+});
+
+run('same-paragraph prefetch waits when paused before first playback', () => {
+    const paths = stubs({ text: 'One paragraph.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_SYNTH_DELAY: '200', KKR_STUB_FFPLAY_HOLD: '1' }, `
+    await wait(() => events().some(event => !event.tool && event.action === 'prepare'));
+    child.stdin.write('pause\\n');
+    await wait(() => syntheses().length === 1 && events().some(event => event.tool === 'worker-response' && event.id === syntheses()[0].id));
+    await sleep(300);
+    assert(players().length === 0 && syntheses().length === 1, 'pause allowed playback or successor synthesis');
+    child.stdin.write('resume\\n');
+    await wait(() => players().length === 1 && syntheses().length === 2);
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+    assert(exited.code === 0, 'Stop failed');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch stops advancing when paused during successor synthesis', () => {
+    const paths = stubs({ text: 'One paragraph.\n' });
+    try {
+        // Outlast the six-second wait bound even when child startup exceeds the rewind window.
+        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_SYNTH_DELAY: '250', KKR_STUB_FFPLAY_HOLD_MS: '1000',
+            KKR_STUB_PCM_SAMPLES: String(24000 * 10), KKR_STUB_PCM_BY_PHONEME: '{"one":1,"two":2,"three":3}' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    const first = players()[0];
+    child.stdin.write('pause\\n');
+    await wait(() => !alive(first.pid));
+    await wait(() => events().some(event => event.tool === 'worker-response' && event.id === syntheses()[1].id));
+    await sleep(350);
+    assert(syntheses().length === 2 && players().length === 1, 'pause advanced beyond the in-flight successor');
+    child.stdin.write('resume\\n');
+    await wait(() => syntheses().length === 3 && players().length >= 2);
+    const replay = players()[1];
+    const replayExit = events().find(event => event.tool === 'ffplay-exit' && event.pid === replay.pid);
+    const replayInput = events().find(event => event.tool === 'ffplay-input' && event.pid === replay.pid);
+    assert(replayInput && Buffer.from(replayInput.pcm, 'base64')[0] === 1, 'second player did not replay the first unit');
+    assert(replayExit && syntheses()[2].at >= replayExit.at, 'third unit ran ahead while first was replayed');
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+    assert(exited.code === 0, 'Stop failed');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch Stop cancels the worker without playing stale audio', () => {
+    const paths = stubs({ text: 'One paragraph.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD: '1' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    const worker = events().find(event => event.tool === 'worker');
+    const player = players()[0];
+    child.stdin.write('stop\\n');
+    await wait(() => exited && !alive(worker.pid) && !alive(player.pid));
+    await sleep(450);
+    assert(exited.code === 0, 'Stop failed');
+    assert(syntheses().length === 2 && players().length === 1, 'stale work continued after Stop');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch navigation discards pending successor PCM', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const pcm = { one: Buffer.alloc(8, 1).toString('base64'), two: Buffer.alloc(8, 2).toString('base64'), next: Buffer.alloc(8, 4).toString('base64') };
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS_BY_TEXT: '{"First.":["one","two","three"],"Second.":["next"]}',
+            KKR_STUB_PCM_BY_PHONEME: JSON.stringify(pcm), KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD_MS: '1000' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    const oldWorker = events().find(event => event.tool === 'worker');
+    child.stdin.write('next\\n');
+    await wait(() => events().some(event => event.tool === 'ffplay-input' && event.pcm === '${pcm.next}'));
+    assert(!alive(oldWorker.pid), 'navigation left the old worker alive');
+    assert(!syntheses().some(event => event.phonemes === 'three'), 'navigation synthesized another stale unit');
+    assert(!events().some(event => event.tool === 'ffplay-input' && event.pcm === '${pcm.two}'), 'navigation played the stale successor');
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch navigation from pause keeps the new target withheld', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS_BY_TEXT: '{"First.":["one","two","three"],"Second.":["next"]}',
+            KKR_STUB_SYNTH_DELAY: '400', KKR_STUB_FFPLAY_HOLD: '1' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    child.stdin.write('pause\\nnext\\n');
+    await wait(() => syntheses().some(event => event.phonemes === 'next'));
+    await sleep(500);
+    assert(players().length === 1, 'paused navigation started the new target');
+    assert(!syntheses().some(event => event.phonemes === 'three'), 'paused navigation continued stale synthesis');
+    child.stdin.write('resume\\n');
+    await wait(() => players().length === 2);
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+    assert(exited.code === 0, 'Stop failed');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('cross-paragraph prefetch does not start synthesis after prepare completes while paused', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_SYNTH_DELAY: '600', KKR_STUB_FFPLAY_HOLD_MS: '1000' }, `
+    await wait(() => events().some(event => !event.tool && event.action === 'prepare' && event.text === 'Second.') && players().length === 1);
+    const preparing = events().find(event => !event.tool && event.action === 'prepare' && event.text === 'Second.');
+    child.stdin.write('pause\\n');
+    await wait(() => events().some(event => event.tool === 'worker-response' && event.id === preparing.id));
+    await sleep(250);
+    assert(syntheses().length === 1 && players().length === 1, 'paused preparation launched successor synthesis');
+    child.stdin.write('resume\\n');
+    await wait(() => syntheses().length === 2 && players().length === 3);
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+    assert(exited.code === 0, 'Stop failed');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch failure stops playback and exits with an error', () => {
+    const paths = stubs({ text: 'One paragraph.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_FAIL_PHONEMES: 'two',
+            KKR_STUB_SYNTH_DELAY: '800', KKR_STUB_FFPLAY_HOLD: '1' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    const player = players()[0];
+    await wait(() => exited && !alive(player.pid));
+    assert(exited.code === 1 && stderr.includes('stub synthesis failed'), 'lookahead error was not surfaced');
+    assert(syntheses().length === 2 && players().length === 1, 'failed lookahead launched further work');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('same-paragraph prefetch failure exits even while playback is paused', () => {
+    const paths = stubs({ text: 'One paragraph.\n' });
+    try {
+        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_FAIL_PHONEMES: 'two',
+            KKR_STUB_SYNTH_DELAY: '800', KKR_STUB_FFPLAY_HOLD: '1' }, `
+    await wait(() => syntheses().length === 2 && players().length === 1);
+    child.stdin.write('pause\\n');
+    await wait(() => exited);
+    assert(exited.code === 1 && stderr.includes('stub synthesis failed'), 'paused lookahead error was not surfaced');
+    assert(!players().some(player => alive(player.pid)), 'paused lookahead error left a player alive');
+    assert(syntheses().length === 2, 'paused lookahead error launched further work');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
+run('live playback retains only active and successor preparation across long documents', async () => {
+    for (const unitCount of [1, 3]) {
+        const text = Array.from({ length: 48 }, (_, index) => `paragraph-${index}`);
+        const played = [], synthesized = [], samples = [];
+        let controller;
+        const sample = () => samples.push({ index: controller.index, keys: [...controller.prefetched.keys()] });
+        const PlaybackController = playbackHarness(async pcm => { sample(); played.push(pcm.toString()); });
+        const worker = {
+            async prepare(paragraph) { sample(); return Array.from({ length: unitCount }, (_, index) => `${paragraph}-unit-${index}`); },
+            async synthesize(phonemes) { synthesized.push(phonemes); return { pcm: Buffer.from(phonemes), sampleRate: 24000 }; },
+            async close() {},
+        };
+        controller = new PlaybackController(text, worker, { START_PARA: 1 });
+        controller.waitForParagraphGap = async () => {};
+        try {
+            await controller.run();
+            const expected = text.flatMap(paragraph => Array.from({ length: unitCount }, (_, index) => `${paragraph}-unit-${index}`));
+            assert(JSON.stringify(played) === JSON.stringify(expected), 'eviction changed or skipped played units');
+            assert(JSON.stringify(synthesized) === JSON.stringify(expected), 'eviction duplicated or skipped synthesis');
+            assert(samples.every(sample => sample.keys.length <= 2 && sample.keys.every(key => key >= sample.index && key <= sample.index + 1)),
+                `completed preparation accumulated: maximum retained ${Math.max(...samples.map(sample => sample.keys.length))}`);
+            assert(controller.prefetched.size === 0, 'final paragraph preparation was not evicted');
+        } finally { controller.close(); }
+    }
+});
+
+run('live playback releases consumed first-unit PCM from cached preparation', async () => {
+    let controller;
+    const retained = [];
+    const PlaybackController = playbackHarness(async () => {
+        const prepared = await controller.prefetched.get(controller.index);
+        retained.push(prepared.audio);
+    });
+    const worker = {
+        async prepare() { return ['one', 'two', 'three']; },
+        async synthesize() { return { pcm: Buffer.alloc(1024), sampleRate: 24000 }; },
+        async close() {},
+    };
+    controller = new PlaybackController(['One.'], worker, { START_PARA: 1 });
+    try {
+        await controller.run();
+        assert(retained.length === 3 && retained.every(audio => audio === null), 'cached preparation retained the consumed first-unit PCM');
+    } finally { controller.close(); }
+});
+
+run('failed lookahead immediately releases cached paragraph preparation', async () => {
+    const PlaybackController = playbackHarness(async () => {});
+    const worker = {
+        async prepare() { return ['one', 'two']; },
+        async synthesize(phonemes) { if (phonemes === 'two') throw new Error('planned successor failure'); return { pcm: Buffer.alloc(1024), sampleRate: 24000 }; },
+        async close() {},
+    };
+    const controller = new PlaybackController(['One.'], worker, { START_PARA: 1 });
+    try {
+        let failure;
+        try { await controller.run(); } catch (error) { failure = error; }
+        assert(failure?.message === 'planned successor failure', 'lookahead failure was not surfaced');
+        assert(controller.prefetched.size === 0, 'failed lookahead retained cached preparation');
+    } finally { controller.close(); }
+});
+
+run('controller close releases completed and outstanding paragraph preparation', async () => {
+    const PlaybackController = playbackHarness(async () => {});
+    let finishPrepare, markStarted;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    const worker = {
+        async prepare(text) { if (text === 'Two.') { markStarted(); return new Promise(resolve => { finishPrepare = resolve; }); } return [text]; },
+        async synthesize() { return { pcm: Buffer.alloc(1024), sampleRate: 24000 }; },
+        async close() {},
+    };
+    const controller = new PlaybackController(['One.', 'Two.'], worker, { START_PARA: 1 });
+    await controller.prepareParagraph(0, controller.generation);
+    const pending = controller.prepareParagraph(1, controller.generation, true);
+    try {
+        await started;
+        controller.close();
+        assert(controller.prefetched.size === 0, 'close retained completed or outstanding preparation');
+    } finally {
+        finishPrepare(['Two.']);
+        await pending;
+        controller.close();
+    }
+    assert(controller.prefetched.size === 0, 'settled preparation was reinserted after close');
+});
+
+run('previous after forward eviction prepares and plays the preceding paragraph again', () => {
+    const paths = stubs({ text: 'First.\n\nSecond.\n' });
+    const first = Buffer.alloc(8, 1).toString('base64');
+    try {
+        liveProbe(paths, { KKR_STUB_PCM_BY_PHONEME: JSON.stringify({ 'First.': first, 'Second.': Buffer.alloc(8, 2).toString('base64') }),
+            KKR_STUB_FFPLAY_HOLD_MS: '500' }, `
+    await wait(() => players().length === 2);
+    child.stdin.write('previous\\n');
+    await wait(() => events().filter(event => event.tool === 'ffplay-input' && event.pcm === '${first}').length === 2);
+    const prepared = events().filter(event => !event.tool && event.action === 'prepare' && event.text === 'First.');
+    assert(prepared.length === 2, 'Previous reused or lost evicted preparation');
+    assert(syntheses().filter(event => event.phonemes === 'First.').length === 2, 'Previous skipped or duplicated the new synthesis');
+    child.stdin.write('stop\\n');
+    await wait(() => exited);
+    assert(exited.code === 0, 'Stop failed');
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
+});
+
 run('navigation during synthesis replaces the worker and plays only the selected paragraph', () => {
     const paths = stubs({ text: 'First.\n\nSecond.\n\nThird.\n' });
     const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
@@ -1287,21 +2007,15 @@ run('failed lookahead prevents or stops active playback immediately', () => {
 
 run('live playback leaves 800 ms between source paragraphs', () => {
     const paths = stubs({ text: 'First.\n\nSecond.\n' });
-    const child = spawn(process.execPath, [CLI, ...cliArgs(paths), paths.input], {
-        env: { ...process.env, ...stubEnv(paths), KKR_STUB_FFPLAY_HOLD_MS: '100' },
-    });
-    child.stderr.resume();
     try {
-        assert(waitFor(() => stubEvents(paths).filter(event => event.tool === 'ffplay').length >= 2),
-            'second paragraph never began playback');
-        const plays = stubEvents(paths).filter(event => event.tool === 'ffplay');
-        const firstExit = stubEvents(paths).find(event => event.tool === 'ffplay-exit' && event.pid === plays[0].pid);
-        assert(firstExit && plays[1].at - firstExit.at >= 700,
-            `paragraph gap was ${plays[1].at - firstExit.at} ms, expected about 800 ms`);
-    } finally {
-        child.kill();
-        fs.rmSync(paths.dir, { recursive: true, force: true });
-    }
+        liveProbe(paths, { KKR_STUB_FFPLAY_HOLD_MS: '100' }, `
+    await wait(() => players().length >= 2);
+    const firstExit = events().find(event => event.tool === 'ffplay-exit' && event.pid === players()[0].pid);
+    assert(firstExit && players()[1].at - firstExit.at >= 700, 'source paragraph gap was shorter than 800 ms');
+    child.stdin.write('stop\\n');
+    await wait(() => exited && events().filter(event => event.pid).every(event => !alive(event.pid)));
+`);
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
 });
 
 run('saved audio includes 800 ms of silence between source paragraphs', () => {
@@ -1350,6 +2064,179 @@ run('download verifies existing assets by sha256 and never replaces them unasked
     assert(unchanged, 'an unverified asset was replaced without --force');
 });
 
+run('download preserves preexisting staging files and symlink sentinels', async () => {
+    for (const symlink of [false, true]) {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+        const target = path.join(directory, 'kokoro-v1.0.onnx');
+        const sentinel = path.join(directory, 'sentinel');
+        fs.writeFileSync(sentinel, 'unrelated sentinel');
+        if (symlink) fs.symlinkSync(sentinel, target + '.download');
+        else fs.writeFileSync(target + '.download', 'unrelated staging');
+        const harness = downloadHarness();
+        try {
+            await harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true });
+            assert(fs.readFileSync(sentinel, 'utf8') === 'unrelated sentinel', 'download overwrote a staging symlink target');
+            assert(fs.existsSync(target + '.download') && (symlink ? fs.lstatSync(target + '.download').isSymbolicLink() : fs.readFileSync(target + '.download', 'utf8') === 'unrelated staging'), 'download changed or removed unrelated staging');
+            for (const [name, payload] of Object.entries(harness.payloads)) assert(fs.readFileSync(path.join(directory, name)).equals(payload), 'verified fixture was not published completely');
+            assert(harness.files.every(file => path.dirname(path.dirname(file)) === directory && !fs.existsSync(path.dirname(file))), 'download did not clean private sibling staging');
+        } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+    }
+});
+
+run('concurrent downloads use independent private staging and complete publication', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+    const held = [];
+    let released = false;
+    const transport = (response, payload) => released ? response.end(payload) : held.push({ response, payload });
+    const left = downloadHarness(transport), right = downloadHarness(transport);
+    const jobs = [left, right].map(harness => harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true }));
+    // Attach rejection handlers before checking paths or releasing either transfer.
+    const completed = Promise.allSettled(jobs);
+    const release = () => { released = true; for (const { response, payload } of held.splice(0)) response.end(payload); };
+    try {
+        await new Promise(resolve => setImmediate(resolve));
+        assert(left.files.length === 1 && right.files.length === 1 && left.files[0] !== right.files[0], 'concurrent downloads shared staging');
+        for (const file of [...left.files, ...right.files]) assert((fs.statSync(path.dirname(file)).mode & 0o777) === 0o700 && path.dirname(path.dirname(file)) === directory, 'download staging was not a private sibling directory');
+        release();
+        const results = await completed;
+        assert(results.every(result => result.status === 'fulfilled'), 'a concurrent downloader failed');
+        for (const [name, payload] of Object.entries(left.payloads)) assert(fs.readFileSync(path.join(directory, name)).equals(payload), 'concurrent downloads mixed or truncated publication');
+        assert([...left.files, ...right.files].every(file => !fs.existsSync(path.dirname(file))), 'concurrent download left private staging');
+    } finally { release(); await completed; fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+run('failed download transfers close writers, preserve assets, and remove owned staging', async () => {
+    const cases = [
+        { detail: 'incomplete', send: (response, payload) => response.end(payload.subarray(0, -1)) },
+        { detail: 'corrupt', send: (response, payload) => response.end(Buffer.alloc(payload.length, 42)) },
+        { detail: 'fixture stream failure', send: response => response.destroy(new Error('fixture stream failure')) },
+        { detail: 'fixture request failure', send: (response, payload, request) => request.destroy(new Error('fixture request failure')) },
+    ];
+    for (const scenario of cases) {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+        const target = path.join(directory, 'kokoro-v1.0.onnx');
+        fs.writeFileSync(target, 'previous custom model');
+        fs.writeFileSync(target + '.download', 'unrelated staging');
+        const harness = downloadHarness(scenario.send);
+        try {
+            let failure;
+            try { await harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true }); }
+            catch (error) { failure = error; }
+            assert(failure?.message.includes(scenario.detail), `wrong transfer failure: ${failure?.message}`);
+            assert(fs.readFileSync(target, 'utf8') === 'previous custom model' && fs.readFileSync(target + '.download', 'utf8') === 'unrelated staging', 'failed download changed prior or unrelated files');
+            assert(harness.writers.every(writer => writer.closed) && fs.readdirSync(directory).every(name => !name.startsWith('.kokoreader-download-')), 'failed download removed staging before writers closed or leaked it');
+        } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+    }
+});
+
+run('download cancellation closes its transfer before owned staging cleanup', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+    const target = path.join(directory, 'kokoro-v1.0.onnx');
+    fs.writeFileSync(target, 'previous custom model');
+    let ready;
+    const started = new Promise(resolve => { ready = resolve; });
+    const harness = downloadHarness((response, payload) => { response.write(payload.subarray(0, 4)); ready(); });
+    const failure = harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true }).catch(error => error);
+    try {
+        await started;
+        await harness.killActive();
+        const error = await failure;
+        assert(error?.message.includes('cancelled'), 'download cancellation did not reject publication');
+        assert(fs.readFileSync(target, 'utf8') === 'previous custom model' && harness.writers.every(writer => writer.closed), 'cancelled download changed prior output or left an open writer');
+        assert(fs.readdirSync(directory).every(name => !name.startsWith('.kokoreader-download-')), 'cancelled download left private staging');
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+run('download errors and cancellation await writer close with an early pipeline callback', async () => {
+    const { pipeline } = require('stream');
+    for (const cancelled of [false, true]) {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-close-'));
+        const target = path.join(directory, 'kokoro-v1.0.onnx');
+        fs.writeFileSync(target, 'previous custom model');
+        let ready, early = false;
+        const started = new Promise(resolve => { ready = resolve; });
+        // Older Node pipelines can report a source error before the file's close.
+        // Keep real pipeline teardown and filesystem streams, advancing only its callback.
+        const earlyPipeline = (source, writer, callback) => {
+            if (!(writer instanceof fs.WriteStream)) return pipeline(source, writer, callback);
+            source.once('error', error => { early = !writer.closed; callback(error); });
+            return pipeline(source, writer, () => {});
+        };
+        const harness = downloadHarness(response => {
+            if (cancelled) { response.write('part'); ready(); }
+            else response.destroy(new Error('fixture early pipeline failure'));
+        }, undefined, undefined, earlyPipeline);
+        const failure = harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true }).catch(error => error);
+        try {
+            if (cancelled) { await started; await harness.killActive(); }
+            const error = await failure;
+            assert(early && error?.message.includes(cancelled ? 'cancelled' : 'fixture early pipeline failure'), 'fixture did not report an early source failure');
+            assert(harness.writers.every(writer => writer.closed), 'download settled before owned writer close');
+            assert(fs.readFileSync(target, 'utf8') === 'previous custom model', 'failed transfer replaced the prior asset');
+            assert(fs.readdirSync(directory).every(name => !name.startsWith('.kokoreader-download-')), 'failed transfer left private staging');
+        } finally {
+            await Promise.all(harness.writers.filter(writer => !writer.closed).map(writer => new Promise(resolve => writer.once('close', resolve))));
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    }
+});
+
+run('synchronous download transport setup failure cleans its allocated staging', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+    const harness = downloadHarness(undefined, new Error('fixture transport setup failure'));
+    try {
+        let failure;
+        try { await harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true }); }
+        catch (error) { failure = error; }
+        assert(failure?.message === 'fixture transport setup failure' && fs.readdirSync(directory).length === 0, 'transport setup failure left private staging');
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+run('CLI signal cancels an owned download and preserves prior assets and staging', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-signal-'));
+    const target = path.join(directory, 'kokoro-v1.0.onnx');
+    const hook = path.join(directory, 'offline-https.js');
+    fs.writeFileSync(target, 'previous custom model');
+    fs.writeFileSync(target + '.download', 'unrelated staging');
+    fs.writeFileSync(hook, `const Module = require('module'), { EventEmitter } = require('events'), { PassThrough } = require('stream');
+const load = Module._load;
+Module._load = function(name, ...args) {
+  if (name !== 'https') return load.call(this, name, ...args);
+  return { get(url, callback) {
+    const request = new EventEmitter(), response = new PassThrough();
+    const hold = setInterval(() => {}, 1000);
+    request.setTimeout = () => request;
+    request.destroy = error => { clearInterval(hold); request.emit('error', error); response.destroy(error); };
+    response.statusCode = 200; response.headers = { 'content-length': '10000' };
+    setImmediate(() => { callback(response); response.write(Buffer.from('held')); });
+    return request;
+  } };
+};`);
+    const child = spawn(process.execPath, ['-r', hook, CLI, '--download', '--force', '--model-dir', directory], { stdio: ['ignore', 'ignore', 'pipe'] });
+    child.stderr.resume();
+    const closed = new Promise(resolve => child.once('close', (code, signal) => resolve({ code, signal })));
+    try {
+        assert(waitFor(() => fs.readdirSync(directory).some(name => name.startsWith('.kokoreader-download-') && fs.existsSync(path.join(directory, name, 'asset.download')))), 'offline download did not start writing private staging');
+        child.kill('SIGTERM');
+        const result = await closed;
+        assert(result.code === 128, 'signal did not complete cooperative download cleanup');
+        assert(fs.readFileSync(target, 'utf8') === 'previous custom model' && fs.readFileSync(target + '.download', 'utf8') === 'unrelated staging', 'signal changed prior assets or unrelated staging');
+        assert(fs.readdirSync(directory).every(name => !name.startsWith('.kokoreader-download-')), 'signal left private download staging');
+    } finally { child.kill(); await closed; fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+run('download redirects close retired bodies before continuing verified publication', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-'));
+    const retired = [];
+    const harness = downloadHarness((response, payload) => { if (response.statusCode === 200) response.end(payload); }, undefined,
+        (response, url) => { if (retired.length === 0) { response.statusCode = 302; response.headers.location = url + '?mirror=1'; retired.push(response); } });
+    try {
+        await harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true });
+        assert(retired.every(response => response.destroyed), 'redirect left its retired response body open');
+        for (const [name, payload] of Object.entries(harness.payloads)) assert(fs.readFileSync(path.join(directory, name)).equals(payload), 'redirect bypassed verified publication');
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
 run('--force is download-only and documented', () => {
     const result = cli(['--force']);
     assert(result.status !== 0, '--force without --download unexpectedly succeeded');
@@ -1378,9 +2265,9 @@ run('signaling the CLI mid-export leaves no temporary encoder file behind', () =
     child.stderr.resume();
     child.once('exit', () => {});
     try {
-        assert(waitFor(() => (fs.existsSync(`${out}.part`) || null)), 'encoder never started');
+        assert(waitFor(() => exportDirectories(out).length > 0), 'encoder never started');
         child.kill('SIGTERM');
-        assert(waitFor(() => (!fs.existsSync(`${out}.part`) && !fs.existsSync(out)) || null, 3000),
+        assert(waitFor(() => (exportDirectories(out).length === 0 && !fs.existsSync(out)) || null, 3000),
             'temporary or published file survived the signal');
     } finally {
         child.kill();
@@ -1396,6 +2283,23 @@ run('worker language warnings reach the user once per distinct message', () => {
     const shown = (result.stderr.match(/Kokoreader: espeak-ng cannot read/g) || []).length;
     assert(shown === 1, `warning appeared ${shown} times for 2 paragraphs, expected 1`);
     fs.rmSync(paths.dir, { recursive: true, force: true });
+});
+
+run('voice-language mismatch warnings reach CLI once and editor status without failing', () => {
+    const paths = stubs();
+    const warning = 'voice "af_aoede" prefix suggests --lang en-us, but --lang es was selected; this experimental pairing may sound incorrect';
+    try {
+        const result = cli([...cliArgs(paths), '--lang', 'es', paths.input], { env: { ...stubEnv(paths), KKR_STUB_WARNING: warning } });
+        assert(result.status === 0 && result.stderr.split(warning).length === 2, 'mismatch warning was lost, repeated, or made fatal');
+        const sourcePath = '/tmp/kokoreader-voice-warning.md';
+        const harness = extensionHarness({ selection: { isEmpty: true },
+            document: { uri: { fsPath: sourcePath, scheme: 'file', toString: () => `file://${sourcePath}` }, fileName: sourcePath, getText: () => 'text' } });
+        try {
+            harness.commands.get('kokoreader.readFile')();
+            harness.spawned[0].child.stderr.emit('data', Buffer.from(`Kokoreader: ${warning}\n`));
+            assert(harness.statusItems[0].text.includes(warning) && harness.errors.length === 0, 'editor did not surface the nonfatal mismatch warning');
+        } finally { harness.extension.deactivate(); }
+    } finally { fs.rmSync(paths.dir, { recursive: true, force: true }); }
 });
 
 run('--list-languages maps voice initials to codes and lists what espeak-ng accepts', () => {

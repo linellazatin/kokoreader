@@ -7,6 +7,8 @@ const os = require('os');
 const path = require('path');
 const https = require('https');
 const readline = require('readline');
+const { StringDecoder } = require('string_decoder');
+const { pipeline } = require('stream');
 const { spawn } = require('child_process');
 
 const MODEL_FILES = {
@@ -337,6 +339,16 @@ function paragraphs(text, cfg) {
         .filter(Boolean);
 }
 
+function collectStderr(stream, debug = false) {
+    const decoder = new StringDecoder('utf8');
+    let tail = '';
+    const append = text => { tail = (tail + text).slice(-8192); };
+    stream.on('data', chunk => { append(decoder.write(chunk)); if (debug) process.stderr.write(chunk); });
+    stream.on('end', () => append(decoder.end()));
+    stream.on('error', () => {});
+    return () => tail.trim().replace(/\s+/g, ' ').slice(-800);
+}
+
 class Worker {
     constructor(cfg) {
         const { model, voices } = requireAssets(cfg);
@@ -359,15 +371,19 @@ class Worker {
             this.close();
         }, WORKER_STARTUP_TIMEOUT_MS);
         readline.createInterface({ input: this.proc.stdout }).on('line', line => this.receive(line));
-        this.proc.stderr.on('data', chunk => { if (cfg.DEBUG) process.stderr.write(chunk); });
+        const diagnostic = collectStderr(this.proc.stderr, cfg.DEBUG);
         this.proc.on('error', error => {
+            this.exited = true;
             this.fail(error);
             this.finishExit();
         });
-        this.proc.on('exit', (code, signal) => {
+        this.proc.on('exit', () => { this.exited = true; });
+        this.proc.on('close', (code, signal) => {
             this.exited = true;
             this.finishExit();
-            this.fail(new Error(code === null ? `Kokoro worker exited from ${signal || 'a signal'}` : `Kokoro worker exited with code ${code}`));
+            const detail = diagnostic();
+            const status = code === null ? `Kokoro worker exited from ${signal || 'a signal'}` : `Kokoro worker exited with code ${code}`;
+            this.fail(new Error(status + (detail ? `: ${detail}` : '')));
         });
     }
     receive(line) {
@@ -469,7 +485,11 @@ function warnOnce(message) {
 let activeFfmpeg = null;
 let activeFfplay = null;
 let activeWorker = null;
-let activePartFile = null;
+let activeExportDirectory = null;
+let activeEncoder = null;
+let activeDownload = null;
+let stopping = false;
+let cleanupPromise = null;
 let playbackPaused = false;
 let liveController = null;
 let playbackCancelled = false;
@@ -479,22 +499,31 @@ let activePause = null;
 const onResume = new Set();
 
 function killActive() {
-    for (const child of [activeWorker && activeWorker.proc, activeFfmpeg, activeFfplay]) {
-        try { child && child.kill(); } catch (_) {}
+    if (cleanupPromise) return cleanupPromise;
+    stopping = true;
+    playbackCancelled = true;
+    const worker = activeWorker;
+    const encoder = activeEncoder;
+    if (liveController) { liveController.generation++; liveController.close(); }
+    const closing = [worker?.close(), encoder?.abort(), activeDownload?.abort()];
+    for (const child of [activeFfmpeg, activeFfplay]) {
+        try { child?.kill(); } catch (_) {}
     }
     activeFfmpeg = activeFfplay = activeWorker = null;
     activePause = null;
     onResume.clear();
     playbackPaused = false;
-    // process.exit skips read()'s finally, so the in-flight encoder's temporary
-    // file has to be reaped here or Ctrl-C and Stop litter the user's folder.
-    if (activePartFile) { try { fs.unlinkSync(activePartFile); } catch (_) {} activePartFile = null; }
+    // Wait for owned file handles to close before removing encoder output.
+    cleanupPromise = Promise.race([Promise.allSettled(closing), delay(WORKER_SHUTDOWN_MS + 500)]).then(() => {
+        if (activeExportDirectory) { try { fs.rmSync(activeExportDirectory, { recursive: true, force: true }); } catch (_) {} activeExportDirectory = null; }
+    });
+    return cleanupPromise;
 }
 
 // A signal that bypasses the stdin 'stop' line (editor reload, Ctrl-C, the
 // extension's fallback kill) must still reap the resident worker and player.
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-    process.on(signal, () => { killActive(); process.exit(128); });
+    process.on(signal, () => { killActive().then(() => process.exit(128)); });
 }
 
 function pausePlayback() {
@@ -514,7 +543,7 @@ function setupIPC() {
         if (line.trim() === 'pause') pausePlayback();
         if (line.trim() === 'resume') resumePlayback();
         if (['previous', 'replay', 'next'].includes(line.trim()) && liveController) liveController.navigate(line.trim());
-        if (line.trim() === 'stop') { killActive(); process.exit(0); }
+        if (line.trim() === 'stop') killActive().then(() => process.exit(0));
     });
 }
 
@@ -536,8 +565,9 @@ function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function playPCM(pcm, sampleRate, cfg) {
     let offset = 0;
-    while (offset < pcm.length) {
-        while (playbackPaused) await new Promise(wake => onResume.add(wake));
+    while (offset < pcm.length && !playbackCancelled) {
+        while (playbackPaused && !playbackCancelled) await new Promise(wake => onResume.add(wake));
+        if (playbackCancelled) return;
         offset = await playSegment(pcm, offset, sampleRate, cfg);
     }
 }
@@ -587,29 +617,66 @@ function startSaveEncoder(cfg, sampleRate) {
     // One encoder for the whole document, fed as paragraphs are synthesized: the
     // old design buffered every paragraph and encoded at the end, which cost
     // ~1.65 MB per spoken minute and lost all work if anything failed late.
-    const temporary = `${cfg.OUTPUT_FILE}.part`;
-    activePartFile = temporary;
+    const directory = fs.mkdtempSync(path.join(path.dirname(cfg.OUTPUT_FILE), '.kokoreader-export-'));
+    const temporary = path.join(directory, 'audio.part');
+    activeExportDirectory = directory;
+    const cleanup = () => {
+        try { fs.rmSync(directory, { recursive: true, force: true }); } catch (_) {}
+        if (activeExportDirectory === directory) activeExportDirectory = null;
+    };
     const args = ['-y', '-hide_banner', '-loglevel', 'error', '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', 'pipe:0', '-af', ffmpegFilter(cfg)];
     if (cfg.SAMPLE_RATE) args.push('-ar', String(cfg.SAMPLE_RATE));
     args.push('-f', cfg.FORMAT, temporary);
-    const ffmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'ignore'] });
+    let ffmpeg;
+    try { ffmpeg = activeFfmpeg = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'pipe'] }); }
+    catch (error) { cleanup(); throw error; }
     ffmpeg.stdin.on('error', () => {});
+    const diagnostic = collectStderr(ffmpeg.stderr);
+    let cancelled = false, exited = false, killTimer = null, failure = null;
+    const closed = new Promise(resolve => ffmpeg.once('close', () => {
+        exited = true;
+        clearTimeout(killTimer);
+        if (activeFfmpeg === ffmpeg) activeFfmpeg = null;
+        if (activeEncoder?.stdin === ffmpeg.stdin) activeEncoder = null;
+        resolve();
+    }));
+    // Close listeners below publish synchronously before this cleanup microtask.
+    closed.then(cleanup);
+    ffmpeg.once('spawn', () => { if (cancelled) { try { ffmpeg.kill(); } catch (_) {} } });
     const done = new Promise((resolve, reject) => {
         ffmpeg.on('error', reject);
-        ffmpeg.on('exit', code => {
-            if (code !== 0) return reject(new Error(`ffmpeg exited with code ${code}`));
+        ffmpeg.on('close', (code, signal) => {
+            if (cancelled) return reject(new Error('Audio export cancelled'));
+            if (code !== 0) {
+                const detail = diagnostic();
+                const status = code === null ? `ffmpeg exited from ${signal || 'a signal'}` : `ffmpeg exited with code ${code}`;
+                return reject(new Error(status + (detail ? `: ${detail}` : '')));
+            }
             if (!fs.existsSync(temporary)) return reject(new Error(`ffmpeg produced no audio for ${cfg.OUTPUT_FILE}`));
-            try { fs.renameSync(temporary, cfg.OUTPUT_FILE); if (activePartFile === temporary) activePartFile = null; resolve(); }
+            try { fs.renameSync(temporary, cfg.OUTPUT_FILE); resolve(); }
             catch (error) { reject(error); }
         });
     });
-    // Publish atomically: a failed read must leave the previous file alone, and
-    // the killed encoder must not leave a stray .part behind.
-    done.catch(() => { try { fs.unlinkSync(temporary); } catch (_) {} });
-    return {
+    // Publish atomically, then remove only this operation's private directory
+    // after encoder handles close. A failed read leaves the previous file alone.
+    done.catch(error => { if (!cancelled) failure = error; });
+    return activeEncoder = {
         stdin: ffmpeg.stdin,
         done,
-        abort() { try { ffmpeg.stdin.destroy(); ffmpeg.kill(); } catch (_) {} },
+        get failure() { return failure; },
+        async write(pcm) {
+            try { await new Promise((resolve, reject) => ffmpeg.stdin.write(pcm, error => error ? reject(error) : resolve())); }
+            catch (error) {
+                await this.abort();
+                throw failure || new Error(`ffmpeg input failed: ${diagnostic() || error.message}`);
+            }
+        },
+        abort() {
+            cancelled = true;
+            try { ffmpeg.stdin.destroy(); ffmpeg.kill(); } catch (_) {}
+            if (!exited && !killTimer) killTimer = setTimeout(() => { try { ffmpeg.kill('SIGKILL'); } catch (_) {} }, WORKER_SHUTDOWN_MS);
+            return closed;
+        },
     };
 }
 
@@ -634,6 +701,7 @@ class PlaybackController {
         this.workerClosing = Promise.resolve(); this.cancelGap = null;
     }
     cancelWorker() {
+        this.prefetched.clear();
         const worker = this.worker;
         this.worker = null;
         if (activeWorker === worker) activeWorker = null;
@@ -644,13 +712,14 @@ class PlaybackController {
         playbackCancelled = true;
         if (this.cancelGap) this.cancelGap();
         if (activePause) activePause();
+        for (const wake of [...onResume]) { onResume.delete(wake); wake(); }
         for (const child of [activeFfmpeg, activeFfplay]) {
             try { child?.kill(); } catch (_) {}
         }
     }
     async ensureWorker(generation) {
         await this.workerClosing;
-        if (generation !== undefined && generation !== this.generation) return null;
+        if (stopping || (generation !== undefined && generation !== this.generation)) return null;
         if (!this.worker) this.worker = activeWorker = new Worker(this.cfg);
         return this.worker;
     }
@@ -661,13 +730,17 @@ class PlaybackController {
         this.prefetched.clear();
         this.cancelWorker();
     }
-    async prepareParagraph(paragraph, generation) {
+    async waitForPlayback(generation) {
+        while (playbackPaused && generation === this.generation) await new Promise(wake => onResume.add(wake));
+        return generation === this.generation;
+    }
+    async prepareParagraph(paragraph, generation, prefetch = false) {
         if (this.prefetched.has(paragraph)) return this.prefetched.get(paragraph);
         const promise = (async () => {
             const worker = await this.ensureWorker(generation);
-            if (!worker) return null;
+            if (!worker || (prefetch && !await this.waitForPlayback(generation))) return null;
             const units = await worker.prepare(this.text[paragraph], this.cfg);
-            if (generation !== this.generation) return null;
+            if (generation !== this.generation || (prefetch && !await this.waitForPlayback(generation))) return null;
             const audio = await worker.synthesize(units[0], this.cfg);
             return { units, audio };
         })().catch(error => {
@@ -681,8 +754,23 @@ class PlaybackController {
         this.prefetched.set(paragraph, promise);
         return promise;
     }
+    async prefetchUnit(phonemes, generation) {
+        try {
+            const worker = await this.ensureWorker(generation);
+            if (!worker || !await this.waitForPlayback(generation)) return null;
+            return await worker.synthesize(phonemes, this.cfg);
+        } catch (error) {
+            if (generation === this.generation) {
+                this.fatal = error;
+                this.generation++;
+                this.cancelWorker();
+            }
+            throw error;
+        }
+    }
     async run() {
-        while (this.index < this.text.length) {
+        while (this.index < this.text.length && !stopping) {
+            if (this.fatal) throw this.fatal;
             const generation = this.generation;
             const paragraph = this.index;
             process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] preparing...`);
@@ -690,31 +778,39 @@ class PlaybackController {
             try { prepared = await this.prepareParagraph(paragraph, generation); }
             catch (error) { if (generation !== this.generation) continue; throw error; }
             if (!prepared || generation !== this.generation) continue;
+            let audio = prepared.audio;
+            prepared.audio = null;
             for (let unit = 0; unit < prepared.units.length; unit++) {
+                if (!await this.waitForPlayback(generation)) break;
                 process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] synthesizing...`);
-                let audio;
                 try {
-                    const worker = unit === 0 ? null : await this.ensureWorker(generation);
-                    if (unit && !worker) break;
-                    audio = unit === 0 ? prepared.audio : await worker.synthesize(prepared.units[unit], this.cfg);
+                    if (!audio) {
+                        const worker = await this.ensureWorker(generation);
+                        if (!worker) break;
+                        audio = await worker.synthesize(prepared.units[unit], this.cfg);
+                    }
                 }
                 catch (error) { if (generation !== this.generation) break; throw error; }
                 if (generation !== this.generation) break;
                 process.stderr.write(`\r[${paragraph + 1}/${this.text.length}] playing...     `);
-                const lookahead = unit === prepared.units.length - 1 && paragraph + 1 < this.text.length ?
-                    this.prepareParagraph(paragraph + 1, generation) : null;
-                if (lookahead) lookahead.catch(() => {});
-                await Promise.resolve();
-                if (this.fatal) throw this.fatal;
                 playbackCancelled = false;
-                await playPCM(audio.pcm, audio.sampleRate, this.cfg);
+                const playing = playPCM(audio.pcm, audio.sampleRate, this.cfg);
+                const nextUnit = unit + 1 < prepared.units.length;
+                const lookahead = playbackPaused ? null : nextUnit ?
+                    this.prefetchUnit(prepared.units[unit + 1], generation) : paragraph + 1 < this.text.length ?
+                    this.prepareParagraph(paragraph + 1, generation, true) : null;
+                if (lookahead) lookahead.catch(() => {});
+                await playing;
+                if (this.fatal) throw this.fatal;
+                audio = null;
                 if (lookahead) {
-                    try { await lookahead; }
+                    try { const result = await lookahead; if (nextUnit) audio = result; }
                     catch (error) { if (generation === this.generation) throw error; }
                 }
                 if (generation !== this.generation) break;
             }
             if (generation !== this.generation) continue;
+            this.prefetched.delete(paragraph);
             this.index++;
             if (this.index < this.text.length) await this.waitForParagraphGap();
         }
@@ -751,14 +847,18 @@ async function read(inputFile, cfg) {
             for await (const unit of units) {
                 process.stderr.write(`\r[${unit.paragraph}/${unit.total}] synthesizing...`);
                 const result = await worker.synthesize(unit.phonemes, cfg);
-                if (!saver) saver = startSaveEncoder(cfg, result.sampleRate);
+                if (stopping) break;
+                if (!saver) {
+                    saver = startSaveEncoder(cfg, result.sampleRate);
+                    saver.done.catch(() => { worker.close(); });
+                }
                 if (previousParagraph && unit.paragraph !== previousParagraph) {
                     const bytes = Math.round(result.sampleRate * 2 * cfg.TEMPO * PARAGRAPH_PAUSE_MS / 1000);
-                    await new Promise((resolve, reject) => saver.stdin.write(Buffer.alloc(bytes), error => error ? reject(error) : resolve()));
+                    await saver.write(Buffer.alloc(bytes));
                 }
                 // The write callback fires once flushed to the OS, which is the
                 // backpressure that keeps memory bounded to one synthesis unit.
-                await new Promise((resolve, reject) => saver.stdin.write(result.pcm, error => error ? reject(error) : resolve()));
+                await saver.write(result.pcm);
                 previousParagraph = unit.paragraph;
             }
         } else {
@@ -768,50 +868,53 @@ async function read(inputFile, cfg) {
         if (saver) { saver.stdin.end(); await saver.done; }
         process.stderr.write('\n');
     } catch (error) {
-        if (saver) saver.abort();
-        throw error;
+        if (saver) { await saver.abort(); if (saver.failure) error = saver.failure; }
+        if (!stopping) throw error;
     } finally {
-        if (liveController) liveController.close(); else worker?.close();
+        if (liveController) { liveController.close(); await liveController.workerClosing; } else await worker?.close();
         activeWorker = null;
         liveController = null;
         if (inputFile) process.stdin.destroy();
     }
 }
 
-function download(url, destination, redirects = 0) {
+function download(url, destination, redirects = 0, operation) {
     return new Promise((resolve, reject) => {
+        if (stopping || operation?.cancelled) return reject(new Error('Model download cancelled'));
+        let body = null;
         const request = https.get(url, response => {
             if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-                response.resume();
+                response.destroy();
                 if (redirects >= 5) return reject(new Error('download failed: too many redirects'));
-                return resolve(download(new URL(response.headers.location, url).href, destination, redirects + 1));
+                return resolve(download(new URL(response.headers.location, url).href, destination, redirects + 1, operation));
             }
-            if (response.statusCode !== 200) { response.resume(); return reject(new Error(`download failed: HTTP ${response.statusCode}`)); }
+            if (response.statusCode !== 200) { response.destroy(); return reject(new Error(`download failed: HTTP ${response.statusCode}`)); }
+            body = response;
             const expected = Number(response.headers['content-length']);
             const file = fs.createWriteStream(destination);
+            const closed = new Promise(resolve => file.once('close', resolve));
             let received = 0;
             response.on('data', chunk => { received += chunk.length; });
-            response.pipe(file);
-            file.on('error', reject);
-            response.on('error', reject);
-            file.on('finish', () => file.close(() => {
-                // A truncated asset renames to the real filename and then fails
-                // opaquely at inference time, so reject it here instead.
+            pipeline(response, file, async error => {
+                // Older Node pipelines can report an error before the file closes.
+                await closed;
+                if (error) return reject(error);
                 if (expected && received !== expected) return reject(new Error(`download failed: incomplete (${received}/${expected} bytes)`));
                 resolve();
-            }));
+            });
         });
+        if (operation) operation.request = request;
         request.setTimeout(60000, () => request.destroy(new Error('download timed out')));
-        request.on('error', reject);
+        request.on('error', error => { if (body) body.destroy(error); else reject(error); });
     });
 }
 
-function sha256File(file) {
+function sha256File(file, operation) {
     return new Promise((resolve, reject) => {
         const hash = crypto.createHash('sha256');
-        fs.createReadStream(file).on('error', reject).pipe(hash);
-        hash.on('error', reject);
-        hash.on('finish', () => resolve(hash.digest('hex')));
+        const reader = fs.createReadStream(file);
+        if (operation) operation.reader = reader;
+        pipeline(reader, hash, error => error ? reject(error) : resolve(hash.digest('hex')));
     });
 }
 
@@ -820,6 +923,7 @@ async function downloadAssets(cfg) {
     fs.mkdirSync(cfg.MODEL_DIR, { recursive: true });
     const downloads = { [MODEL_FILES[cfg.MODEL_PRECISION]]: MODEL_URLS[cfg.MODEL_PRECISION], [VOICES_FILE]: VOICES_URL };
     for (const [name, url] of Object.entries(downloads)) {
+        if (stopping) throw new Error('Model download cancelled');
         const target = path.join(cfg.MODEL_DIR, name);
         const expected = ASSET_SHA256[name];
         if (fs.existsSync(target)) {
@@ -833,17 +937,34 @@ async function downloadAssets(cfg) {
             }
             process.stdout.write(`Replacing unverified ${name}...\n`);
         }
-        const temporary = `${target}.download`;
+        const directory = fs.mkdtempSync(path.join(cfg.MODEL_DIR, '.kokoreader-download-'));
+        const temporary = path.join(directory, 'asset.download');
+        let finish;
+        const closed = new Promise(resolve => { finish = resolve; });
+        const operation = activeDownload = {
+            cancelled: false, request: null, reader: null,
+            abort() {
+                this.cancelled = true;
+                const error = new Error('Model download cancelled');
+                this.request?.destroy(error);
+                this.reader?.destroy(error);
+                return closed;
+            },
+        };
         try {
             process.stdout.write(`Downloading ${name}...\n`);
-            await download(url, temporary);
+            await download(url, temporary, 0, operation);
             if (expected) {
-                const digest = await sha256File(temporary);
+                const digest = await sha256File(temporary, operation);
                 if (digest !== expected) throw new Error(`${name} is corrupt: sha256 ${digest}, expected ${expected}`);
             }
+            if (stopping || operation.cancelled) throw new Error('Model download cancelled');
             fs.renameSync(temporary, target);
         }
-        finally { try { fs.unlinkSync(temporary); } catch (_) {} }
+        finally {
+            try { fs.rmSync(directory, { recursive: true, force: true }); }
+            finally { if (activeDownload === operation) activeDownload = null; finish(); }
+        }
     }
 }
 
@@ -881,4 +1002,4 @@ async function main() {
     await read(parsed.inputFile, cfg);
 }
 
-main().catch(error => { process.stderr.write(`Error: ${error.message}\n`); process.exitCode = 1; });
+main().catch(error => { if (!stopping) { process.stderr.write(`Error: ${error.message}\n`); process.exitCode = 1; } });

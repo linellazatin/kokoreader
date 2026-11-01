@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0
+
+### Fixed
+- Fixed gaps caused by missing prefetch within long paragraphs. Prepared the next unit while the current one played, keeping playback ordered and the 800 ms pause between source paragraphs.
+- Fixed prefetch advancing while paused and lookahead errors leaving playback stuck until Resume. Paused playback stopped queuing new requests, and failures released pause waits.
+- Fixed consumed audio accumulating during long reads. Limited preparation to the current paragraph and its successor, released played audio and cleared pending preparation on cancellation.
+- Fixed export Stop releasing ownership before cleanup finished. Kept the export process and its private input until streams closed, added a 2.5-second hard-kill fallback and waited for cleanup during deactivation.
+- Fixed export errors hiding useful setup and encoder details. Showed bounded, UTF-8-safe diagnostics after stderr drained, without saving source/diagnostic text or reporting cancellation as failure.
+- Fixed late failures from missing voices and invalid style data. Checked voice selection, style dimensions, numeric type and finite values before phonemization/inference; warned about voice/language mismatches without blocking experimental pairings or custom prefixes.
+- Fixed incompatible model/runtime pairs reaching worker readiness and fractional speeds being silently truncated. Rejected unsupported contracts before readiness and fractional speeds on INT32-speed graphs.
+- Fixed overlapping exports sharing partial files and cleanup affecting unrelated `.part` files/symlinks. Used private staging and atomic publication, cleaned owned paths after setup failure or encoder close, and kept the last successful publication as the final output.
+- Fixed downloads sharing staging paths and cleaning up before writers closed. Used private staging, preserved unrelated `.download` files/symlinks and closed writers before cleanup, including on older Node pipelines. Aborted transfers on signals and kept cancelled, truncated or digest-mismatched downloads from replacing existing assets; preserved custom/force rules.
+- Fixed local files leaking into VSIX packages. Limited packages to ten intended distribution files, excluded logs, environments, local configuration, staging and audio, and checked file selection before CI packaging.
+- Fixed the workflow Node version falling below the publishing tool's requirement. Moved validation and release jobs to Node.js 22 without changing tool versions or action revisions.
+- Fixed editor-launched CLI startup. Enabled Electron's Node mode and used the legacy bootstrap flag only where older VS Code required it; kept VSCodium, current Electron and plain-Node launches working without changing the editor 1.75 minimum.
+
+### Changed
+- Made the Workspace Trust requirement explicit; kept the extension disabled in Restricted Mode and retained the VS Code/VSCodium 1.75 minimum.
+- Pinned ONNX Runtime to 1.28.0 and blocked older versions before loading a model. Kept Kokoro 0.4.7, the Python 3.11 minimum and the existing v1.0 assets.
+- Clarified the wrapper's MIT license and separate runtime/model terms; distinguished future bundling duties from optional upstream build/training assurance.
+- Clarified that `--force` restored pinned assets rather than accepting regenerated upstream bytes, and recommended maintained `Node.js` LTS without raising compatibility minimums.
+
 ## 0.3.0
 
 ### Added

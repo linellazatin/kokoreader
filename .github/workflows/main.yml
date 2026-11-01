@@ -16,7 +16,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Run tests
         run: npm test
@@ -29,6 +29,9 @@ jobs:
 
       - name: Install vsce
         run: npm install -g @vscode/vsce@4.0.0
+
+      - name: Check package file selection
+        run: node test/package.js
 
       - name: Package extension
         run: vsce package --out kokoreader.vsix
@@ -50,7 +53,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Verify tag version
         run: test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./package.json').version")"
