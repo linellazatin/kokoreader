@@ -81,7 +81,14 @@ function showSetup(setting) {
 }
 
 function spawnCli(args, options) {
-    return spawn(process.execPath, [path.join(__dirname, '..', 'bin', 'kokoreader.js'), ...args], options);
+    const electron = process.versions.electron;
+    const [major, minor, patch] = (electron || '').split('.').map(Number);
+    // Only Microsoft's old Electron builds require this private gate, removed in 27.2.1.
+    const legacy = electron && vscode.env.appName.startsWith('Visual Studio Code')
+        && (major < 27 || (major === 27 && (minor < 2 || (minor === 2 && patch < 1))));
+    const bootstrap = legacy ? ['--ms-enable-electron-run-as-node'] : [];
+    const launch = electron ? { ...options, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } } : options;
+    return spawn(process.execPath, [...bootstrap, path.join(__dirname, '..', 'bin', 'kokoreader.js'), ...args], launch);
 }
 
 function stop() {

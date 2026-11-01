@@ -297,6 +297,29 @@ function playbackHarness(play) {
     return context.module.exports.PlaybackController;
 }
 
+for (const [electron, appName, legacy] of [
+    ['', 'Visual Studio Code', false], ['19.1.9', 'Visual Studio Code', true],
+    ['27.1.3', 'Visual Studio Code', true], ['27.2.1', 'Visual Studio Code', false],
+    ['43.8.3', 'Visual Studio Code', false], ['19.1.9', 'VSCodium', false],
+]) run(`${electron ? `${appName} Electron ${electron}` : 'plain Node'} editor host preserves the correct CLI bootstrap`, () => {
+    const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');
+    const calls = [], child = {};
+    const host = { execPath: '/editor/node', versions: electron ? { electron } : {}, env: { KEEP: 'host environment', ELECTRON_RUN_AS_NODE: '0' } };
+    const context = { require: name => name === 'vscode' ? { env: { appName } } : name === 'child_process' ? { spawn(...args) { calls.push(args); return child; } } : require(name),
+        process: host, __dirname: path.join(ROOT, 'extension'), module: { exports: {} } };
+    vm.runInNewContext(source + '\nmodule.exports = { spawnCli };', context);
+    const options = { stdio: ['pipe', 'ignore', 'pipe'] };
+    assert(context.module.exports.spawnCli(['--help'], options) === child, 'bootstrap did not return the reader process');
+    const [executable, args, spawnedOptions] = calls[0];
+    const expected = [CLI, '--help'];
+    if (legacy) expected.unshift('--ms-enable-electron-run-as-node');
+    assert(executable === host.execPath && JSON.stringify(args) === JSON.stringify(expected), 'editor CLI bootstrap arguments were incorrect');
+    if (electron) {
+        assert(spawnedOptions.env.KEEP === host.env.KEEP && spawnedOptions.env.ELECTRON_RUN_AS_NODE === '1', 'Electron launch did not preserve environment and enable Node mode');
+        assert(spawnedOptions.stdio === options.stdio && !options.env && host.env.ELECTRON_RUN_AS_NODE === '0', 'bootstrap mutated caller options or host environment');
+    } else assert(spawnedOptions === options, 'plain Node launch options changed');
+});
+
 run('--help describes the Kokoro reader CLI', () => {
     const result = cli(['--help']);
     assert(result.status === 0, `exit ${result.status}: ${result.stderr}`);
