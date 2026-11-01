@@ -431,6 +431,14 @@ run('extension manifest exposes read, playback, and save commands', () => {
     }
 });
 
+run('extension explicitly requires trust without changing the editor minimum', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    const policy = manifest.capabilities && manifest.capabilities.untrustedWorkspaces;
+    assert(policy && policy.supported === false, 'Restricted Mode is not explicitly unsupported');
+    assert(typeof policy.description === 'string' && policy.description.includes('Python') && policy.description.includes('model'), 'trust requirement does not explain executable and model selection');
+    assert(manifest.engines.vscode === '^1.75.0', 'trust declaration changed the editor minimum');
+});
+
 run('extension save command and format setting are format-neutral', () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
     const source = fs.readFileSync(path.join(ROOT, 'extension', 'extension.js'), 'utf8');

@@ -9,6 +9,12 @@
   "publisher": "openlines",
   "author": "Linel Lazatin",
   "engines": { "vscode": "^1.75.0" },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Kokoreader runs a configured Python executable and loads configured model files. Trust the workspace before using it."
+    }
+  },
   "categories": ["Machine Learning", "Other"],
   "main": "./extension/extension.js",
   "bin": { "kokoreader": "./bin/kokoreader.js" },
