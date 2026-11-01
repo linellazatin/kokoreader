@@ -519,6 +519,12 @@ run('runtime source uses the organized project layout', () => {
     assert(!fs.existsSync(path.join(ROOT, 'extension.js')), 'extension remains at the project root');
 });
 
+run('Python requirements pin the approved adapter and ONNX Runtime baseline', () => {
+    const requirements = fs.readFileSync(path.join(ROOT, 'python', 'requirements.txt'), 'utf8').split(/\r?\n/);
+    assert(requirements.includes('kokoro-onnx==0.4.7'), 'adapter pin changed');
+    assert(requirements.includes('onnxruntime==1.28.0'), 'secure ONNX Runtime baseline is not pinned');
+});
+
 run('CLI loads its default config from the config directory', () => {
     const source = fs.readFileSync(path.join(ROOT, 'bin', 'kokoreader.js'), 'utf8');
     assert(source.includes("path.join(__dirname, '..', 'config', 'kokoreader.conf')"), 'default config is not in config/kokoreader.conf');

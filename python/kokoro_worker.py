@@ -13,6 +13,7 @@ import onnxruntime as ort
 import phonemizer
 from kokoro_onnx import Kokoro
 from kokoro_onnx.tokenizer import Tokenizer
+from packaging.version import Version
 from phonemizer.backend import EspeakBackend
 
 # The espeak-ng code each Kokoro voice initial stands for, per hexgrad/Kokoro-82m
@@ -174,6 +175,8 @@ def main():
     runtime = metadata.version('kokoro-onnx')
     if runtime != '0.4.7':
         raise ValueError(f'this worker requires kokoro-onnx 0.4.7, found {runtime}; use python/requirements.txt with the configured Python or upgrade runtime and model assets together')
+    if Version(ort.__version__) < Version('1.28.0'):
+        raise ValueError(f'this worker requires onnxruntime 1.28.0 or newer, found {ort.__version__}; install python/requirements.txt with the configured Python')
     options = ort.SessionOptions()
     if args.threads:
         options.intra_op_num_threads = args.threads
@@ -257,7 +260,8 @@ def selfcheck():
 
     def serve_fixture(request=None, styles=None, token_name='tokens',
                       token_type='tensor(int64)', speed_type='tensor(float)',
-                      style_type='tensor(float)', runtime='0.4.7', token_shape=None):
+                      style_type='tensor(float)', runtime='0.4.7', token_shape=None,
+                      ort_version='1.28.0', expect_no_session=False):
         styles = {'af_aoede': valid_style} if styles is None else styles
         inputs = [SimpleNamespace(name=token_name, type=token_type, shape=token_shape or [1, 'length']),
                   SimpleNamespace(name='style', type=style_type, shape=[1, 256]),
@@ -272,11 +276,17 @@ def selfcheck():
              patch.object(sys, 'stdin', StringIO(json.dumps(message) + '\n' if request is not None else '')), \
              patch.object(sys, 'stdout', output), \
              patch.object(metadata, 'version', return_value=runtime), \
-             patch.object(ort, 'InferenceSession', return_value=session), \
+             patch.object(ort, '__version__', ort_version), \
+             patch.object(ort, 'InferenceSession', return_value=session) as create_session, \
              patch.object(Kokoro, 'from_session', return_value=model), \
              patch.object(EspeakBackend, 'supported_languages', return_value={'en-us': 'English', 'es': 'Spanish'}), \
              patch.object(phonemizer, 'phonemize', return_value='a') as phonemize:
-            main()
+            try:
+                main()
+            finally:
+                if expect_no_session:
+                    create_session.assert_not_called()
+                    assert not output.getvalue(), 'unsupported ORT announced readiness'
         return [json.loads(line) for line in output.getvalue().splitlines()], phonemize.call_count, create.call_count
 
     for action in ('prepare', 'synthesize'):
@@ -310,6 +320,11 @@ def selfcheck():
         else:
             raise AssertionError(f'unsupported model/runtime was not rejected: {kwargs}')
 
+    for ort_version in ('1.23.2', '1.24.1', '1.27.0', '1.28.0rc1', '1.28.0.dev1'):
+        expect_guard_error('onnxruntime 1.28.0', ort_version=ort_version, expect_no_session=True)
+    for ort_version in ('1.28.0', '1.28.1', '1.29.0'):
+        messages, _, _ = serve_fixture(ort_version=ort_version)
+        assert messages == [{'ready': True}], f'supported ORT was rejected: {ort_version}'
     expect_guard_error('0.4.7', runtime='0.6.1')
     expect_guard_error('inputs', token_name='unknown')
     expect_guard_error('tokens', token_type='tensor(int32)')
