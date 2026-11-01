@@ -30,6 +30,9 @@ jobs:
       - name: Install vsce
         run: npm install -g @vscode/vsce@4.0.0
 
+      - name: Check package file selection
+        run: node test/package.js
+
       - name: Package extension
         run: vsce package --out kokoreader.vsix
 

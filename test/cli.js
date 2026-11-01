@@ -496,11 +496,11 @@ run('CLI loads its default config from the config directory', () => {
 run('GitHub workflows validate pull requests separately from tagged releases', () => {
     const validate = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'validate.yml'), 'utf8');
     const release = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
-    for (const fragment of ['pull_request:', 'permissions:\n      contents: read', 'npm test', 'node --check bin/kokoreader.js', 'python3 -m py_compile python/kokoro_worker.py', '@vscode/vsce@4.0.0', 'vsce package']) {
+    for (const fragment of ['pull_request:', 'permissions:\n      contents: read', 'npm test', 'node --check bin/kokoreader.js', 'python3 -m py_compile python/kokoro_worker.py', '@vscode/vsce@4.0.0', 'node test/package.js', 'vsce package']) {
         assert(validate.includes(fragment), `missing PR validation step: ${fragment}`);
     }
     assert(!validate.includes('actions/upload-artifact'), 'PR validation retains an unused artifact upload');
-    for (const fragment of ["tags:\n      - 'v*'", 'needs: validate', 'actions/upload-artifact', 'actions/download-artifact', 'publish release/kokoreader.vsix', 'softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65']) {
+    for (const fragment of ["tags:\n      - 'v*'", 'needs: validate', 'actions/upload-artifact', 'actions/download-artifact', 'node test/package.js', 'publish release/kokoreader.vsix', 'softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65']) {
         assert(release.includes(fragment), `missing release workflow step: ${fragment}`);
     }
     assert(!release.includes('pull_request:'), 'release workflow still handles pull requests');
@@ -521,13 +521,15 @@ run('GitHub Actions are pinned to immutable revisions', () => {
 
 run('local CLI configuration is excluded from VSIX packages', () => {
     const ignore = fs.readFileSync(path.join(ROOT, '.vscodeignore'), 'utf8');
-    assert(ignore.split(/\r?\n/).includes('config/kokoreader.conf'), 'config/kokoreader.conf is not excluded');
+    const rules = ignore.split(/\r?\n/);
+    assert(rules.includes('**/*') && !rules.includes('!config/kokoreader.conf'), 'local CLI configuration is not excluded by the distribution allowlist');
 });
 
 run('local model assets are excluded from VSIX packages', () => {
     const ignore = fs.readFileSync(path.join(ROOT, '.vscodeignore'), 'utf8').split(/\r?\n/);
-    for (const pattern of ['**/*.onnx', '**/*.bin', '**/*.download', '**/__pycache__/**']) {
-        assert(ignore.includes(pattern), `${pattern} is not excluded`);
+    assert(ignore.includes('**/*'), 'local model assets are not excluded by default');
+    for (const file of ['kkr-models/kokoro-v1.0.onnx', 'kkr-models/voices-v1.0.bin', 'kkr-models/asset.download', 'python/__pycache__/kokoro_worker.pyc']) {
+        assert(!ignore.includes(`!${file}`), `${file} is explicitly included`);
     }
 });
 
