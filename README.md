@@ -68,15 +68,18 @@ Concurrent CLI exports use separate staging directories: the last successful ato
 | `test/` | Node-based checks. |
 
 ## Compatibility
+>
+> ** Windows OS still needs to be further tested - unfortunately I do not have any Windows device as of the current, so I will be depending on everyone's help on this. Feel free to raise an issue, specially if you're on Windows OS.
+>
 
 | Surface | Supported target | Notes |
 | --- | --- | --- |
-| CLI | macOS, Linux, Windows | Needs Node.js, Python 3.11+, and ffmpeg. Live playback also needs ffplay. |
+| CLI | macOS, Linux, Windows** | Needs Node.js, Python 3.11+, and ffmpeg. Live playback also needs ffplay. |
 | Extension | VS Code and VSCodium 1.75+ | Runs the bundled CLI through the editor's Node runtime. |
-| CPU | macOS 14+ Apple silicon, Windows x64, Linux x64 | Pins CPU ONNX Runtime 1.28.0; no official baseline wheels for Intel/older macOS. |
+| CPU | macOS 14+ Apple silicon, Windows** x64, Linux x64 | Pins CPU ONNX Runtime 1.28.0; no official baseline wheels for Intel/older macOS. |
 | Linux ARM64 | Best effort | Matching Python and ONNX Runtime wheels must be available. |
 | Save to File | Any supported CLI platform with ffmpeg | No audio device or ffplay required. |
-| Pause / Resume | macOS verified, Linux and Windows expected | Ends the paragraph's player to mute and replays it on Resume. No platform suspend or mute API is involved. See the table below for what each platform sounds like. |
+| Pause / Resume | macOS verified, Linux and Windows** expected | Ends the paragraph's player to mute and replays it on Resume. No platform suspend or mute API is involved. See the table below for what each platform sounds like. |
 | Remote/headless editor | Save to File, by default | Live playback requires an audio device where the extension host runs. |
 
 `ffplay` cannot be frozen in place, so Pause ends its `ffmpeg`/`ffplay` pair and Resume replays the same paragraph from a remembered offset. What that means per platform:
@@ -85,7 +88,7 @@ Concurrent CLI exports use separate staging directories: the last successful ato
 | --- | --- | --- | --- |
 | macOS | player exits 8-9 ms after the signal, measured | subtle, confirmed by ear | measured: the rest of the paragraph plays, nothing skipped |
 | Linux | same code path: `SIGTERM`, which SDL turns into a quit event that closes the audio device. Not measured. | not known | same arithmetic. Unmeasured: if PulseAudio, PipeWire, or ALSA owns more audio than the 0.8 s back-off, Resume skips that much instead of repeating it. Report it. |
-| Windows | same code path, but Node terminates the process abruptly instead of signalling it, so muting is at least as fast. Not measured. | expected to be the hardest of the three | same arithmetic. Pause did nothing at all before 0.1.3. |
+| Windows** | same code path, but Node terminates the process abruptly instead of signalling it, so muting is at least as fast. Not measured. | expected to be the hardest of the three | same arithmetic. Pause did nothing at all before 0.1.3. |
 
 The character of the click belongs to the audio stack, not to Kokoreader. Only the macOS row has been checked on real hardware.
 
