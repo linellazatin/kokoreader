@@ -143,7 +143,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       process.stdout.write(JSON.stringify({ id: request.id, voices: ['af_heart'] }) + '\\n');
     } else {
       const byPhoneme = process.env.KKR_STUB_PCM_BY_PHONEME ? JSON.parse(process.env.KKR_STUB_PCM_BY_PHONEME) : {};
-      process.stdout.write(JSON.stringify({ id: request.id, pcm: byPhoneme[request.phonemes] || process.env.KKR_STUB_PCM, sampleRate: 24000, warning: process.env.KKR_STUB_WARNING || undefined }) + '\\n');
+      const pcm = process.env.KKR_STUB_PCM_SAMPLES
+        ? Buffer.alloc(Number(process.env.KKR_STUB_PCM_SAMPLES) * 2, byPhoneme[request.phonemes]).toString('base64')
+        : byPhoneme[request.phonemes] || process.env.KKR_STUB_PCM;
+      process.stdout.write(JSON.stringify({ id: request.id, pcm, sampleRate: 24000, warning: process.env.KKR_STUB_WARNING || undefined }) + '\\n');
     }
   };
   delay ? setTimeout(send, delay) : send();
@@ -1594,7 +1597,9 @@ run('same-paragraph prefetch waits when paused before first playback', () => {
 run('same-paragraph prefetch stops advancing when paused during successor synthesis', () => {
     const paths = stubs({ text: 'One paragraph.\n' });
     try {
-        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_SYNTH_DELAY: '250', KKR_STUB_FFPLAY_HOLD_MS: '1000' }, `
+        // Outlast the six-second wait bound even when child startup exceeds the rewind window.
+        liveProbe(paths, { KKR_STUB_UNITS: '["one","two","three"]', KKR_STUB_SYNTH_DELAY: '250', KKR_STUB_FFPLAY_HOLD_MS: '1000',
+            KKR_STUB_PCM_SAMPLES: String(24000 * 10), KKR_STUB_PCM_BY_PHONEME: '{"one":1,"two":2,"three":3}' }, `
     await wait(() => syntheses().length === 2 && players().length === 1);
     const first = players()[0];
     child.stdin.write('pause\\n');
@@ -1606,6 +1611,8 @@ run('same-paragraph prefetch stops advancing when paused during successor synthe
     await wait(() => syntheses().length === 3 && players().length >= 2);
     const replay = players()[1];
     const replayExit = events().find(event => event.tool === 'ffplay-exit' && event.pid === replay.pid);
+    const replayInput = events().find(event => event.tool === 'ffplay-input' && event.pid === replay.pid);
+    assert(replayInput && Buffer.from(replayInput.pcm, 'base64')[0] === 1, 'second player did not replay the first unit');
     assert(replayExit && syntheses()[2].at >= replayExit.at, 'third unit ran ahead while first was replayed');
     child.stdin.write('stop\\n');
     await wait(() => exited);
