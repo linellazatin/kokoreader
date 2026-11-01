@@ -514,6 +514,17 @@ run('GitHub workflows validate pull requests separately from tagged releases', (
     assert(!release.includes('pull_request:'), 'release workflow still handles pull requests');
 });
 
+run('CI uses Node 22 for validation and the existing publishing tool', () => {
+    for (const [file, count] of [['validate.yml', 1], ['main.yml', 2]]) {
+        const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', file), 'utf8');
+        const versions = [...workflow.matchAll(/node-version: '([^']+)'/g)].map(match => match[1]);
+        assert(versions.length === count && versions.every(version => version === '22'), `${file} does not consistently use Node 22, required by ovsx 1.2.0`);
+        assert(workflow.includes('@vscode/vsce@4.0.0'), 'packaging tool pin changed');
+    }
+    const release = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
+    assert(release.includes('ovsx@1.2.0'), 'publishing tool pin changed');
+});
+
 run('GitHub Actions are pinned to immutable revisions', () => {
     const validate = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'validate.yml'), 'utf8');
     const release = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'main.yml'), 'utf8');
