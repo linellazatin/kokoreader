@@ -7,7 +7,7 @@
 
 </div>
 
-Kokoreader reads text and Markdown aloud with local Kokoro inference. It provides a Node.js CLI and a VS Code/VSCodium extension for an editor tab or selection. Synthesis is local: no account, API key, or cloud service is used after one-time dependency and model downloads.
+Kokoreader reads text and Markdown aloud with local Kokoro inference. It provides a `Node.js` CLI and a VS Code/VSCodium extension for an editor tab or selection. Synthesis is local: no account, API key, or cloud service is used after one-time dependency and model downloads.
 
 ## Main Features
 
@@ -24,6 +24,8 @@ Use the CLI for files and pipelines, or use the VS Code/VSCodium extension to re
 ### Long-document playback that stays moving
 
 Kokoreader phonemizes text before synthesis, splits it safely below Kokoro’s model boundary, and synthesizes one upcoming unit while the current one plays, including split units within the same paragraph. It uses one resident inference worker; if the upcoming audio is not ready when playback ends, it waits for that synthesis to finish. Pause allows an already-running prefetch request to finish but withholds further prefetch requests until Resume. That avoids the long-paragraph bounds failure and reduces dead air caused by waiting for the next inference.
+
+Live playback retains paragraph preparation only for the active paragraph and its successor, releases consumed cached PCM, and discards completed entries during forward reading. Source text remains available for navigation; Previous and Replay synthesize the selected paragraph again rather than keeping a document-wide audio cache.
 
 It preserves a natural **800 ms** gap between source paragraphs in both live playback and saved audio, without adding pauses inside a paragraph that was safely split into multiple units. The first unit targets an early sentence boundary within 200 phonemes to reduce time to first audio; later units retain the 500-phoneme safety boundary.
 
@@ -47,11 +49,13 @@ Pause immediately ends the active player so audio stops rather than continuing i
 
 ### Language-aware guardrails
 
-Kokoreader exposes Kokoro voices and eSpeak language codes, validates selected languages before inference, and warns when script or phoneme coverage suggests likely pronunciation loss. This is particularly useful for mixed-language Markdown and non-Latin text.
+Kokoreader validates selected voices, style data, and eSpeak language codes before phonemization or inference. Known voice-prefix/language disagreements warn without blocking experimental pairings; unknown custom prefixes remain usable. Script and phoneme-coverage warnings identify likely pronunciation loss in mixed-language Markdown and non-Latin text.
 
 ### Documentation-grade output
 
-Saved audio is streamed through one ffmpeg encoder, so long exports do not require buffering an entire document in memory. Output is written atomically: a failed export does not replace an existing finished file.
+Saved audio is streamed through one ffmpeg encoder, so long exports do not require buffering an entire document in memory. Each export encodes inside its own private directory beside the destination and publishes by atomic rename; it does not use or remove a preexisting sibling `.part`. Failure or cancellation before publication preserves prior output and cleans only owned staging. Stop requests CLI cleanup; the extension retains ownership and private input until streams close, with a hard-kill fallback after 2.5 seconds. An already-completed publication is not undone.
+
+Concurrent CLI exports use separate staging directories: the last successful atomic publication wins, without ordering or locking guarantees. Use a stable, user-controlled destination directory; this does not defend against malicious ancestor replacement or processes running as the same user.
 
 ## Repository layout
 
@@ -69,7 +73,7 @@ Saved audio is streamed through one ffmpeg encoder, so long exports do not requi
 | --- | --- | --- |
 | CLI | macOS, Linux, Windows | Needs Node.js, Python 3.11+, and ffmpeg. Live playback also needs ffplay. |
 | Extension | VS Code and VSCodium 1.75+ | Runs the bundled CLI through the editor's Node runtime. |
-| CPU | macOS Apple silicon or Intel, Windows x64, Linux x64 | Uses the CPU ONNX Runtime package. |
+| CPU | macOS 14+ Apple silicon, Windows x64, Linux x64 | Pins CPU ONNX Runtime 1.28.0; no official baseline wheels for Intel/older macOS. |
 | Linux ARM64 | Best effort | Matching Python and ONNX Runtime wheels must be available. |
 | Save to File | Any supported CLI platform with ffmpeg | No audio device or ffplay required. |
 | Pause / Resume | macOS verified, Linux and Windows expected | Ends the paragraph's player to mute and replays it on Resume. No platform suspend or mute API is involved. See the table below for what each platform sounds like. |
@@ -85,17 +89,23 @@ Saved audio is streamed through one ffmpeg encoder, so long exports do not requi
 
 The character of the click belongs to the audio stack, not to Kokoreader. Only the macOS row has been checked on real hardware.
 
+Packaged reader/export lifecycle checks pass on macOS, Fedora, and Ubuntu with VS Code 1.75/1.144 and VSCodium 1.75/1.143. Automated playback uses dummy SDL and Save tests substitute the dialog result; manual UI and listening acceptance remain separate. Editor launches preserve the 1.75 minimum without passing Microsoft's obsolete private bootstrap flag to stock VSCodium or current Electron.
+
 Kokoreader is not a mobile, browser, or web-extension tool.
 
 ## Requirements
 
 - Node.js 20 or newer
-- Python 3.11 or newer
+- Python 3.11 or newer; current official runtime wheels cover CPython 3.11–3.14
 - `pip3` for that same Python interpreter
 - ffmpeg, including `ffplay` for live playback
 - About 340 MB free for default model files, plus generated audio
 
-Kokoreader pins its inference dependency in [python/requirements.txt](python/requirements.txt). The configured Python and ffmpeg must be accessible to the CLI, and to the GUI application's environment when using the extension.
+Kokoreader pins `kokoro-onnx==0.4.7` and `onnxruntime==1.28.0` in [python/requirements.txt](python/requirements.txt), and rejects older ONNX Runtime before loading a model. Official macOS installation requires macOS 14+ Apple silicon; Intel/older macOS needs a separately verified patched-source route, not an affected-version fallback. The configured Python and ffmpeg must be accessible to the CLI and the GUI application's environment.
+
+For the standalone CLI, prefer a maintained Node.js LTS release, such as the tested Node.js 22. Node.js 20 remains the compatibility minimum but is upstream EOL; the extension uses its editor runtime, so prefer a maintained editor release too.
+
+Run the CLI suite with `npm test`. CI uses Node.js 22 and runs `node test/package.js` after making `vsce` 4.0.0 available. That check verifies a distribution-file allowlist against disposable local-state fixtures; new runtime files must be added explicitly to `.vscodeignore`.
 
 ## CLI setup
 
@@ -144,7 +154,7 @@ Choose a directory and run:
 node bin/kokoreader.js --model-dir kkr-models --download
 ```
 
-This downloads `kokoro-v1.0.onnx` and `voices-v1.0.bin`. Downloads happen only when explicitly requested, never while reading. If a download fails, remove its partial `.download` file and rerun the command.
+This downloads `kokoro-v1.0.onnx` and `voices-v1.0.bin`. Downloads happen only when explicitly requested, never while reading. A failed or cancelled download cleans its owned staging; rerun the command.
 
 Each asset is checked against the SHA-256 of the file in the [`model-files-v1.0` release](https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.0) it came from, both after download and for files that already exist. A file that fails its digest is reported and left untouched; `--force` replaces exactly those:
 
@@ -152,7 +162,9 @@ Each asset is checked against the SHA-256 of the file in the [`model-files-v1.0`
 node bin/kokoreader.js --model-dir kkr-models --download --force
 ```
 
-That is how you refresh an asset upstream regenerated in place, or one truncated by an interrupted download. Assets that already match are never rewritten, so a deliberately custom `voices-v1.0.bin` is only replaced if you ask for it.
+Use `--force` to restore mismatching files from the pinned release, including truncated files, not to refresh regenerated upstream content. Matching assets are never downloaded or rewritten, even with `--force`. If upstream bytes no longer match the pinned digest, the download fails and preserves the existing file.
+
+Downloads use private operation-owned staging directories inside the model directory; existing sibling `.download` files and symlinks are ignored. Only digest-verified assets publish by atomic rename, and `--force` does not bypass verification. Failed or cancelled transfers close owned streams before staging cleanup. Concurrent downloads use separate staging; use a stable, user-controlled model directory.
 
 FP32 is the default. To explicitly download FP16 or INT8 instead:
 
@@ -162,6 +174,8 @@ node bin/kokoreader.js -md kkr-models -mp int8 -d
 ```
 
 Set the same `MODEL_PRECISION` in configuration or `kokoreader.modelPrecision` in the extension before using a non-FP32 model from `modelDir`.
+
+The current worker requires `kokoro-onnx==0.4.7` and ONNX Runtime 1.28.0 or newer. Its guard covers supported `tokens`/FLOAT-speed and `input_ids`/INT32-speed input signatures, not generic ONNX or vocabulary-identity certification. INT32-speed graphs reject fractional speeds. Voice styles need at least 501 rows of `(1, 256)` real, finite values: FLOAT32 for `tokens`, or safely convertible to FLOAT32 for `input_ids`. Upgrade runtime and assets together, not model URLs alone.
 
 ### 6. Configure the CLI
 
@@ -247,11 +261,13 @@ Set `--pronunciations FILE`, `PRONUNCIATIONS_PATH`, or `kokoreader.pronunciation
 
 ### Debug error log
 
-Every failed extension read or Save to File export appends one JSON Lines record. Records contain only timestamp, operation, process event, exit code or signal, and a generated summary; raw stderr, source text, and audio are never recorded. `kokoreader.debug` still exposes worker errors without replacing playback progress. Kokoreader first writes `<extension>/logs/err.jsonl`, for example `/Users/lines/.vscode-oss/extensions/openlines.kokoreader-0.3.0/logs/err.jsonl`; if that installed directory is not writable, it uses the editor's extension log storage instead. The file rotates at 1 MiB, retaining one previous file as `err.jsonl.1`.
+Every failed extension read or Save to File export appends one JSON Lines record. Records contain only timestamp, operation, process event, exit code or signal, and a generated summary; raw stderr, source text, and audio are never recorded. Export failures show a bounded CLI error after stderr drains, including setup and encoder details without enabling debug. Cancellation produces no success/failure notification or error-log entry. `kokoreader.debug` exposes additional worker diagnostics without replacing playback progress. Kokoreader first writes `<extension>/logs/err.jsonl`, for example `/Users/lines/.vscode-oss/extensions/openlines.kokoreader-0.4.0/logs/err.jsonl`; if that installed directory is not writable, it uses the editor's extension log storage instead. The file rotates at 1 MiB, retaining one previous file as `err.jsonl.1`.
 
 ## VS Code and VSCodium setup
 
 The repository currently contains extension source. Install a packaged `.vsix` once one is built, or use an Extension Development Host when developing locally.
+
+Kokoreader requires Workspace Trust and is disabled in Restricted Mode. Workspace settings can select the Python executable and model files, so review those settings before trusting a workspace. Model-contract checks are not a sandbox for untrusted model files.
 
 Configure these editor settings:
 
@@ -381,6 +397,7 @@ Japanese and Mandarin are the weakest pairings: upstream trains them with misaki
 | --- | --- |
 | `spawn .../bin ENOENT` | `PYTHON_PATH` is a directory. Use a Python executable. |
 | `No module named 'kokoro_onnx'` | Install requirements with the exact configured interpreter. |
+| `requires onnxruntime 1.28.0 or newer` | Reinstall `python/requirements.txt` with the configured interpreter. Intel/older macOS has no official baseline wheel; do not downgrade around the guard. |
 | `model not found` | Run `--download` with `--model-dir`, or correct model paths. |
 | No audio | Verify `ffplay -version` and audio output. Try `--output test.wav` first. |
 | Resume repeats a word or two | Expected. `ffplay` cannot be paused in place, so Pause ends its player and Resume replays the paragraph from the remembered position, about 0.8 s back. |
@@ -391,14 +408,18 @@ Japanese and Mandarin are the weakest pairings: upstream trains them with misaki
 | `Kokoreader: espeak-ng read part of this text as ...` | The paragraph mixes languages and espeak-ng switched. Split the text, or set `--lang` to the dominant language. |
 | `Kokoreader: NN% of the phonemes ... were dropped` | Expected for `cmn`/`yue`: tone digits and vowels are outside Kokoro's vocabulary. Non-Latin output quality is limited by espeak-ng, not by Kokoreader. |
 | `does not match the kokoro-onnx model-files-v1.0 release` | The asset is stale or truncated. Rerun with `--download --force` to replace it. |
-| Worker error | Retry with `--debug` to reveal the Python exception. |
+| Worker error | Check the reported error; retry with `--debug` for additional Python diagnostics. |
 
 ## Known bugs
 
-No reproducible known bugs are currently tracked. Mixed-language Japanese and Mandarin quality remains a documented engine limitation.
+Hardening remains in progress. Windows verification is deferred until a device is available, not passed or waived. Packaged lifecycle checks, native pinned Linux downloads, local TLS failure probes, and Node 20/22 download-close regressions pass. Manual UI/listening acceptance remains pending; the tested ONNX Runtime 1.28.0 baseline is now enforced. Voice/model guards do not certify arbitrary custom graph/vocabulary pairings. Japanese and Mandarin quality remains a documented engine limitation.
 
 ## Credits and licensing
 
-Kokoreader is an independent wrapper inspired by and built around the same Kokoro ONNX inference approach as [Kokoro TTS](https://github.com/nazdridoy/kokoro-tts), created by [Nazmul Hossain (@nazdridoy)](https://github.com/nazdridoy). Thank you for the MIT-licensed reference implementation, CLI design, model-download guidance, and voice behavior.
+Kokoreader is an independent wrapper inspired by and built around the same Kokoro ONNX inference approach as [Kokoro TTS](https://github.com/nazdridoy/kokoro-tts), created by [Nazmul Hossain (@nazdridoy)](https://github.com/nazdridoy). Thank you for the MIT-licensed design reference; no source code was copied or translated from it.
 
-Kokoreader uses [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) for inference and [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) model assets. Review their licenses and notices before redistributing bundled dependencies or model files.
+Kokoreader's original source is [MIT-licensed](LICENSE). It uses [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) and [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), but its current packages do not include Python dependencies, native libraries, model/voice assets or FFmpeg. Users install dependencies and download assets directly from upstream; shipping this wrapper does not redistribute those copies.
+
+The Python worker uses GPL-licensed phonemizer-fork/eSpeak NG. [MIT is GPL-compatible](https://www.gnu.org/licenses/license-list.html#Expat), so original wrapper source can remain MIT; a redistributed combined runtime must still follow the GPL. If you later bundle or mirror dependencies, preserve their applicable licences/notices and provide corresponding source where the GPL requires it. Redistributing Apache-2.0 model/voice assets requires their applicable licence and notices, not training attestations. These are conditional packaging duties, not missing notices for the current unbundled wrapper.
+
+The pinned ONNX matches its [converter origin](https://github.com/taylorchu/kokoro-onnx/releases/tag/v0.2.0), and repacking all 54 original voice tensors reproduces the pinned voice file exactly. Such provenance checks provide supply-chain assurance; the inspected licences do not require upstream build/training attestations or an independent training-data audit to use or distribute this wrapper.
