@@ -253,7 +253,7 @@ const wait = async check => {
     assert(result.status === 0, `live probe failed: ${result.stderr}`);
 }
 
-function downloadHarness(transport, getError, configure) {
+function downloadHarness(transport, getError, configure, pipelineImpl) {
     const { PassThrough } = require('stream');
     const crypto = require('crypto');
     const payloads = { 'kokoro-v1.0.onnx': Buffer.from('offline model fixture'), 'voices-v1.0.bin': Buffer.from('offline voice fixture') };
@@ -277,7 +277,7 @@ function downloadHarness(transport, getError, configure) {
         return request;
     } };
     const source = fs.readFileSync(CLI, 'utf8');
-    const context = { require: name => name === 'https' ? https : name === 'fs' ? { ...fs, createWriteStream(file, ...args) {
+    const context = { require: name => name === 'https' ? https : name === 'stream' && pipelineImpl ? { ...require(name), pipeline: pipelineImpl } : name === 'fs' ? { ...fs, createWriteStream(file, ...args) {
         files.push(file); const writer = fs.createWriteStream(file, ...args); writers.push(writer); return writer;
     } } : require(name), Buffer, setTimeout, clearTimeout, URL, __dirname: path.dirname(CLI), module: { exports: {} },
         process: { env: {}, on() {}, stdout: { write() {} }, stderr: { write() {} } } };
@@ -2116,6 +2116,40 @@ run('download cancellation closes its transfer before owned staging cleanup', as
         assert(fs.readFileSync(target, 'utf8') === 'previous custom model' && harness.writers.every(writer => writer.closed), 'cancelled download changed prior output or left an open writer');
         assert(fs.readdirSync(directory).every(name => !name.startsWith('.kokoreader-download-')), 'cancelled download left private staging');
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+run('download errors and cancellation await writer close with an early pipeline callback', async () => {
+    const { pipeline } = require('stream');
+    for (const cancelled of [false, true]) {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kokoreader-download-close-'));
+        const target = path.join(directory, 'kokoro-v1.0.onnx');
+        fs.writeFileSync(target, 'previous custom model');
+        let ready, early = false;
+        const started = new Promise(resolve => { ready = resolve; });
+        // Older Node pipelines can report a source error before the file's close.
+        // Keep real pipeline teardown and filesystem streams, advancing only its callback.
+        const earlyPipeline = (source, writer, callback) => {
+            if (!(writer instanceof fs.WriteStream)) return pipeline(source, writer, callback);
+            source.once('error', error => { early = !writer.closed; callback(error); });
+            return pipeline(source, writer, () => {});
+        };
+        const harness = downloadHarness(response => {
+            if (cancelled) { response.write('part'); ready(); }
+            else response.destroy(new Error('fixture early pipeline failure'));
+        }, undefined, undefined, earlyPipeline);
+        const failure = harness.downloadAssets({ MODEL_DIR: directory, MODEL_PRECISION: 'fp32', FORCE: true }).catch(error => error);
+        try {
+            if (cancelled) { await started; await harness.killActive(); }
+            const error = await failure;
+            assert(early && error?.message.includes(cancelled ? 'cancelled' : 'fixture early pipeline failure'), 'fixture did not report an early source failure');
+            assert(harness.writers.every(writer => writer.closed), 'download settled before owned writer close');
+            assert(fs.readFileSync(target, 'utf8') === 'previous custom model', 'failed transfer replaced the prior asset');
+            assert(fs.readdirSync(directory).every(name => !name.startsWith('.kokoreader-download-')), 'failed transfer left private staging');
+        } finally {
+            await Promise.all(harness.writers.filter(writer => !writer.closed).map(writer => new Promise(resolve => writer.once('close', resolve))));
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    }
 });
 
 run('synchronous download transport setup failure cleans its allocated staging', async () => {

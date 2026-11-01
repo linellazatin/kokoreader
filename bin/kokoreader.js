@@ -892,9 +892,12 @@ function download(url, destination, redirects = 0, operation) {
             body = response;
             const expected = Number(response.headers['content-length']);
             const file = fs.createWriteStream(destination);
+            const closed = new Promise(resolve => file.once('close', resolve));
             let received = 0;
             response.on('data', chunk => { received += chunk.length; });
-            pipeline(response, file, error => {
+            pipeline(response, file, async error => {
+                // Older Node pipelines can report an error before the file closes.
+                await closed;
                 if (error) return reject(error);
                 if (expected && received !== expected) return reject(new Error(`download failed: incomplete (${received}/${expected} bytes)`));
                 resolve();
